@@ -44,11 +44,38 @@ docker build -t odoo-debugger-sandbox .
 ### 2. Run the Sandbox
 Use the following command to start the interactive Gemini CLI inside the sandbox. 
 
-This command automatically passes your `GOOGLE_CLOUD_PROJECT` host environment variable into the container and mounts your local Odoo source directory to `/source`.
+This command automatically:
+- Passes your `GOOGLE_CLOUD_PROJECT` into the container.
+- Mounts your local Odoo source directory to `/source`.
+- **Persists credentials** by mounting your host's Gemini config directory.
+- **Exposes PostgreSQL** via Unix socket (recommended for Linux).
 
 ```bash
 docker run -it --rm \
   -e GOOGLE_CLOUD_PROJECT \
+  -v /var/run/postgresql:/var/run/postgresql \
+  -v ~/.gemini:/home/gemini/.gemini \
+  -v /path/to/your/odoo/source:/source \
+  odoo-debugger-sandbox
+```
+
+*Note: The first time you run this with a mounted `~/.gemini` folder, the container will automatically register the Odoo MCP tools into your local config.*
+
+## 🐘 Database Configuration
+
+### Custom DB Settings
+If your database is not accessible via the default Unix socket or uses a different user, you can override settings using environment variables:
+- `DB_HOST`: Defaults to `/var/run/postgresql` (set to `localhost` with `--network="host"` for TCP)
+- `DB_USER`: Defaults to `odoo`
+- `DB_PORT`: Defaults to `5432`
+- `DB_PASSWORD`: Defaults to empty string
+
+Example for TCP connection:
+```bash
+docker run -it --rm --network="host" \
+  -e GOOGLE_CLOUD_PROJECT \
+  -e DB_HOST=localhost \
+  -v ~/.gemini:/home/gemini/.gemini \
   -v /path/to/your/odoo/source:/source \
   odoo-debugger-sandbox
 ```

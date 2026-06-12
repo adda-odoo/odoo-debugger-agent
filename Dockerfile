@@ -41,29 +41,19 @@ RUN pip3 install --no-cache-dir \
 # Create a non-root user for security
 RUN useradd --create-home --shell /bin/bash gemini
 
-# Set up directories for agents and skills in the user's home
-RUN mkdir -p /home/gemini/.gemini/agents \
-    && mkdir -p /home/gemini/.agents/skills \
-    && mkdir -p /opt/odoo-debug
+# Set up staging directories for assets
+RUN mkdir -p /opt/odoo-debug/skills
 
-# Copy the agent definition, skills, and MCP server into the image
-# (Paths are relative to the odoo-debugger-agent build context)
-COPY agents/odoo-debugger.md /home/gemini/.gemini/agents/
-COPY skills/odoo-debugger /home/gemini/.agents/skills/odoo-debugger
+# Copy assets to staging area (to avoid shadowing by volume mounts)
+COPY agents/odoo-debugger.md /opt/odoo-debug/
+COPY skills/odoo-debugger /opt/odoo-debug/skills/odoo-debugger
 COPY mcp_servers/debug_server.py /opt/odoo-debug/
 
-# Create a global MCP config that points to the internal path
-RUN echo '{\n\
-  "mcpServers": {\n\
-    "odoo-debug": {\n\
-      "type": "stdio",\n\
-      "command": "python3",\n\
-      "args": ["/opt/odoo-debug/debug_server.py"]\n\
-    }\n\
-  }\n\
-}' > /home/gemini/.mcp.json
+# Add entrypoint script
+COPY entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Fix permissions
+# Fix permissions for staging area and user home
 RUN chown -R gemini:gemini /home/gemini /opt/odoo-debug
 
 # Define the default internal source directory where the user will mount their repos
@@ -76,8 +66,8 @@ USER gemini
 # Set the working directory
 WORKDIR /source
 
-# Set the entrypoint to be gemini cli.
-ENTRYPOINT ["gemini"]
+# Set the entrypoint to our setup script
+ENTRYPOINT ["entrypoint.sh"]
 
-# Default command to start the interactive chat
-CMD []
+# Default command starts interactive Gemini CLI
+CMD ["gemini"]
