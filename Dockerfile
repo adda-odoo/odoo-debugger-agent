@@ -48,6 +48,7 @@ RUN mkdir -p /opt/odoo-debug/skills
 COPY agents/odoo-debugger.md /opt/odoo-debug/
 COPY skills/odoo-debugger /opt/odoo-debug/skills/odoo-debugger
 COPY mcp_servers/debug_server.py /opt/odoo-debug/
+COPY odoo_obfuscate /opt/odoo-debug/odoo_obfuscate
 
 # Add entrypoint script
 COPY entrypoint.sh /usr/local/bin/

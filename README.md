@@ -21,8 +21,8 @@ Before running the sandbox, you must configure your Google Cloud Project to gran
 
 1. **Create a Project:** Visit the [Google Cloud Console](https://console.cloud.google.com/) and create a new project. Make a note of your **Project ID** (not the project name).
 2. **Locate Admin Settings:** Use the top search bar in the Google Cloud Console to search for and select **Admin for Gemini**.
-3. **Enable the Service:** Click to enable **Gemini Code Assist** for your project.
-4. **Configure Settings:** Navigate to the Gemini Code Assist settings page and follow the on-screen prompts to enable Gemini for Google Cloud (this activates the necessary backend APIs).
+3. **Enable the Service:** Click to enable **Gemini Cloud Assist** for your project.
+4. **Configure Settings:** Navigate to the Gemini Cloud Assist settings page and follow the on-screen prompts to enable Gemini for Google Cloud (this activates the necessary backend APIs).
 5. **Enable Preview Models:** Within the settings page, locate the release channel options and switch the channel to **Preview**. Save your changes.
 
 ### 6. Set the Environment Variable (Required)

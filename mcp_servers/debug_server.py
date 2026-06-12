@@ -48,7 +48,7 @@ ODOO_ADDONS = ",".join(addons_paths)
 
 # 4. Resolve internal script locations
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OBFUSCATE_SCRIPT = os.path.join(src_dir, "odoo_obfuscate", "main.py")
+OBFUSCATE_SCRIPT = os.path.join("/opt/odoo-debug", "odoo_obfuscate", "main.py")
 OE_SUPPORT_SCRIPT = os.path.join(src_dir, "support-tools", "oe-support.py")
 
 DB_HOST = "/var/run/postgresql"  # Unix socket — peer auth, no password needed
