@@ -50,6 +50,9 @@ COPY skills/odoo-debugger /opt/odoo-debug/skills/odoo-debugger
 COPY mcp_servers/debug_server.py /opt/odoo-debug/
 COPY odoo_obfuscate /opt/odoo-debug/odoo_obfuscate
 
+# Install dependencies for odoo_obfuscate
+RUN pip3 install --no-cache-dir -r /opt/odoo-debug/odoo_obfuscate/requirements.txt
+
 # Add entrypoint script
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh

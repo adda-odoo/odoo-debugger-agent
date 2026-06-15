@@ -5,7 +5,7 @@ This folder contains a fully self-contained Odoo debugging environment for Gemin
 ## 🚀 Features
 - **Isolated Environment:** Gemini runs in a Docker container with restricted access to your Odoo workspace.
 - **Expert Subagent:** The `@odoo-debugger` agent is pre-configured with Odoo-specific diagnostic workflows.
-- **Deep Inspection:** Built-in DAP (Debug Adapter Protocol) support for inspecting variables, call stacks, and evaluating expressions in a paused Odoo process.
+- **Deep Inspection:** Built-in DAP (Debug Adapter Protocol) support for inspecting variables, call stacks, and evaluating expressions in a paused Odoo process. *(Note: DAP features are currently experimental, lack advanced stepping features, and may be buggy).*
 - **Performance Tools:** Integrated `py-spy` for flamegraphs and `memray` for memory profiling.
 - **Database Utilities:** Tools for fetching SaaS databases, obfuscating PII, and running SQL/ORM queries.
 

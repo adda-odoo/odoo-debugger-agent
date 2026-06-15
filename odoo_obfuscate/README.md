@@ -1,10 +1,10 @@
 # Odoo Smart Synthetic Obfuscator
 
-This is the next-generation Odoo database obfuscation tool, designed for high performance, ease of use, and LLM-compatibility.
+This is an Odoo database obfuscation tool designed for high performance, ease of use, and LLM-compatibility. 
 
-It merges the best features of two legacy tools:
-- **AST Static Analysis:** Automatically discovers sensitive PII fields by parsing Odoo Python source code (from the old `us-support` wrapper).
-- **Synthetic Data Generation (Faker):** Replaces sensitive data with realistic, fake data (e.g., `John Doe`, `user@anon.example.com`) instead of symmetric encryption gibberish.
+Key Features:
+- **AST Static Analysis:** Automatically discovers sensitive PII fields by parsing Odoo Python source code.
+- **Synthetic Data Generation (Faker):** Replaces sensitive data with realistic, fake data (e.g., `John Doe`, `user@anon.example.com`).
 - **High-Speed Execution:** Uses PostgreSQL `COPY` commands into `UNLOGGED` tables, bypassing the ORM for blazing-fast obfuscation of multi-gigabyte databases.
 - **Filestore Scrubbing:** Systematically replaces sensitive PDF and image attachments with blank dummies while preserving UI/theme assets.
 
@@ -28,10 +28,10 @@ pip install -r requirements.txt
 - `--filestore PATH`: (Optional) Explicit path to the Odoo filestore. If omitted, the tool auto-detects it.
 - `--force`: Bypass the idempotency guard (allows re-running on an already obfuscated DB).
 
-## Why not `pgcrypto`?
-Legacy obfuscation tools used symmetric encryption (`pgp_sym_encrypt`). While reversible, this created massive problems:
-1. **Token Explosion:** Encrypted strings cost 10x more tokens when passed to LLMs.
-2. **Semantic Destruction:** LLMs cannot understand or reason about encrypted gibberish.
-3. **Data Leakage:** Legacy tools often ignored the filestore and unstructured chatter (`mail.message.body`), enabling re-identification attacks.
-
+## Why this tool?
 This tool guarantees that your staging and dev environments are completely sanitized, look realistic, and are perfectly safe to share with external developers and AI agents.
+
+By generating synthetic data rather than relying on encryption or other obfuscation methods, this tool ensures:
+1. **Token Efficiency:** Fake realistic strings cost significantly fewer tokens when passed to LLMs compared to encrypted text.
+2. **Semantic Understanding:** LLMs can understand and reason about realistic fake data, allowing for meaningful interactions and testing.
+3. **Comprehensive Data Safety:** This tool comprehensively scrubs both the database and the filestore (including unstructured chatter like `mail.message.body`), preventing re-identification attacks.
