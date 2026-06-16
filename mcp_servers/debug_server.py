@@ -271,13 +271,19 @@ def _call_kw(database: str, model: str, method: str, args: list = None, kwargs: 
 # MCP tools — process management
 # ===========================================================================
 
+_ACCESS_DENIED = "Access denied: '{}' has not been obfuscated. Call obfuscate_database first."
+
+
 @mcp.tool()
-def query_psql(database: str, sql: str) -> str:
+def query_psql(database: str, sql: str, limit: int = 200) -> str:
     """Execute a read-only SQL query against a local Odoo database.
+    
+    Limited to 'limit' rows to make context usage more efficient 
 
     Args:
         database: Database name (e.g. 'odoo', 'adi')
         sql: SQL query to execute (SELECT only)
+        limit: limit the max number of rows to return (default max 200)
     """
     if not _is_obfuscated(database):
         return _ACCESS_DENIED.format(database)
@@ -289,7 +295,9 @@ def query_psql(database: str, sql: str) -> str:
         conn.set_session(readonly=True)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql)
-            rows = cur.fetchall() # TODO might cause context window to blow up if there are too many fetched records, possibly switch to fetchmany 
+            rows = cur.fetchall() 
+            if len(rows) > limit:
+                rows = rows[:limit] # limit to 200 records to save context window TODO may need to implement limit offset + generator object 
         conn.close()
         if not rows:
             return "No rows returned."
@@ -372,9 +380,6 @@ def _is_obfuscated(database: str) -> bool:
         return found
     except Exception:
         return False
-
-
-_ACCESS_DENIED = "Access denied: '{}' has not been obfuscated. Call obfuscate_database first."
 
 
 @mcp.tool()

@@ -36,51 +36,40 @@ export GOOGLE_CLOUD_PROJECT="your_project_id"
 
 ## 🛠️ Setup & Installation
 
-### 1. Build the Docker Image
-Navigate to this directory and build the image:
-```bash
-docker build -t odoo-debugger-sandbox .
-```
+The sandbox uses **Docker Compose** to manage its environment and mounts.
 
-### 2. Run the Sandbox
-Use the following command to start the interactive Gemini CLI inside the sandbox. 
+Use the provided `start.sh` script to start the interactive Gemini CLI inside the sandbox.
 
-This command automatically:
+This script automatically:
+- **Validates** that it is being run alongside the `odoo` and `enterprise` directories.
+- **Prevents permission issues** by safely managing ignored subfolders (like `internal`).
 - Passes your `GOOGLE_CLOUD_PROJECT` into the container.
-- Mounts your local Odoo source directory to `/source`.
+- Mounts your local source directory to `/source`.
 - **Persists credentials** by mounting your host's Gemini config directory.
 - **Exposes PostgreSQL** via Unix socket (recommended for Linux).
+- Builds the image if it does not exist.
 
-Run this command **in your source directory** (the directory containing the odoo, enterprise, etc. repos)
+Run these commands **from your source directory** (the directory containing the `odoo` and `enterprise` repos):
 
 ```bash
-docker run -it --rm \
-  -e GOOGLE_CLOUD_PROJECT \
-  -v /var/run/postgresql:/var/run/postgresql \
-  -v ~/.gemini:/home/gemini/.gemini \
-  -v /PATH/TO/YOUR/SOURCE:/source \
-  odoo-debugger-sandbox
+chmod +x ./odoo-debugger-agent/start.sh   # make executable (only needed for the first time) 
+./odoo-debugger-agent/start.sh
 ```
-*Note: PATH/TO/SOURCE can be replaced with a `.` since your current directory should be the source folder
+
 *Note: The first time you run this with a mounted `~/.gemini` folder, the container will automatically register the Odoo MCP tools into your local config.*
 
 ## 🐘 Database Configuration
 
 ### Custom DB Settings
 If your database is not accessible via the default Unix socket or uses a different user, you can override settings using environment variables:
-- `DB_HOST`: Defaults to `/var/run/postgresql` (set to `localhost` with `--network="host"` for TCP)
+- `DB_HOST`: Defaults to `/var/run/postgresql` (set to `localhost` with `network_mode: "host"` in `docker-compose.yml` for TCP)
 - `DB_USER`: Defaults to `odoo`
 - `DB_PORT`: Defaults to `5432`
 - `DB_PASSWORD`: Defaults to empty string
 
 Example for TCP connection:
 ```bash
-docker run -it --rm --network="host" \
-  -e GOOGLE_CLOUD_PROJECT \
-  -e DB_HOST=localhost \
-  -v ~/.gemini:/home/gemini/.gemini \
-  -v /path/to/your/odoo/source:/source \
-  odoo-debugger-sandbox
+DB_HOST=localhost ./odoo-debugger-agent/start.sh
 ```
 
 ## 📖 Usage

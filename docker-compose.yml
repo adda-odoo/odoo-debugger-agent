@@ -1,0 +1,18 @@
+services:
+  sandbox:
+    build: .
+    image: odoo-debugger-sandbox:latest
+    environment:
+      - GOOGLE_CLOUD_PROJECT
+      - DB_HOST
+      - DB_USER
+      - DB_PORT
+      - DB_PASSWORD
+    volumes:
+      - /var/run/postgresql:/var/run/postgresql
+      - ~/.gemini:/home/gemini/.gemini
+      - ../:/source
+      # Ignore the internal subfolder by mounting an anonymous volume over it
+      - /source/internal
+    stdin_open: true
+    tty: true

@@ -36,7 +36,7 @@ fi
 echo "Configuring odoo-debug MCP server..."
 if gemini mcp add odoo-debug /usr/bin/python3 "$STAGING_DIR/debug_server.py" --scope project; then
     echo "  [OK] MCP server registered in project scope."
-    gemini mcp enable odoo-debug --scope project 2>/dev/null || true
+    gemini mcp enable odoo-debug --scope project 2>/dev/null || true # TODO needs better exception handling
 else
     echo "  [ERROR] MCP server registration failed."
 fi
