@@ -14,6 +14,7 @@ This folder contains a fully self-contained Odoo debugging environment for Gemin
 - `agents/`: Contains the `@odoo-debugger` subagent definition.
 - `skills/`: Contains the `odoo-debugger` skill (best practices & documentation).
 - `mcp_servers/`: Contains the `debug_server.py` MCP implementation.
+- `odoo_obfuscate/`: Contains the database obfuscation tool
 
 ## ☁️ Google Cloud Project Configuration
 
@@ -50,15 +51,17 @@ This command automatically:
 - **Persists credentials** by mounting your host's Gemini config directory.
 - **Exposes PostgreSQL** via Unix socket (recommended for Linux).
 
+Run this command **in your source directory** (the directory containing the odoo, enterprise, etc. repos)
+
 ```bash
 docker run -it --rm \
   -e GOOGLE_CLOUD_PROJECT \
   -v /var/run/postgresql:/var/run/postgresql \
   -v ~/.gemini:/home/gemini/.gemini \
-  -v /path/to/your/odoo/source:/source \
+  -v /PATH/TO/YOUR/SOURCE:/source \
   odoo-debugger-sandbox
 ```
-
+*Note: PATH/TO/SOURCE can be replaced with a `.` since your current directory should be the source folder
 *Note: The first time you run this with a mounted `~/.gemini` folder, the container will automatically register the Odoo MCP tools into your local config.*
 
 ## 🐘 Database Configuration
