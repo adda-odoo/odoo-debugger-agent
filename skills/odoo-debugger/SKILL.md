@@ -14,7 +14,7 @@ Reference the official Odoo documentation for version-specific implementation de
 - [Odoo 17.0 Documentation](https://www.odoo.com/documentation/17.0/)
 
 ## ⚠️ Mandatory Prerequisite
-Whenever you are activated to debug an Odoo issue, you MUST immediately use the `activate_skill` tool to activate the `systematic-debugging` skill (if it is not already activated). You must strictly follow its diagnostic paradigms while utilizing the Odoo MCP tools below.
+Whenever you debug an Odoo issue, you MUST apply systematic debugging discipline while utilizing the Odoo MCP tools below: reproduce the issue, form a single explicit hypothesis, then verify it against real data or execution before acting. Never guess — confirm each assumption with a tool before building on it.
 
 ## ⚠️ Security Prerequisites (CRITICAL)
 

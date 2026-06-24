@@ -26,8 +26,11 @@ RUN mkdir -p /etc/apt/keyrings && \
 RUN apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Gemini CLI globally
-RUN npm install -g @google/gemini-cli
+# Install Antigravity CLI globally (backend: antigravity)
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin
+
+# Install Claude Code CLI globally (backend: claude)
+RUN npm install -g @anthropic-ai/claude-code
 
 # Install Python dependencies for the Odoo MCP server and debugging
 RUN pip3 install --no-cache-dir \
@@ -38,14 +41,14 @@ RUN pip3 install --no-cache-dir \
     py-spy \
     memray
 
-# Create a non-root user for security
-RUN useradd --create-home --shell /bin/bash gemini
+# Create a non-root user for security (backend-neutral name)
+RUN useradd --create-home --shell /bin/bash debugger
 
 # Set up staging directories for assets
 RUN mkdir -p /opt/odoo-debug/skills
 
 # Copy assets to staging area (to avoid shadowing by volume mounts)
-COPY agents/odoo-debugger.md /opt/odoo-debug/
+COPY agents/odoo-debugger /opt/odoo-debug/agents/odoo-debugger
 COPY skills/odoo-debugger /opt/odoo-debug/skills/odoo-debugger
 COPY mcp_servers/debug_server.py /opt/odoo-debug/
 COPY odoo_obfuscate /opt/odoo-debug/odoo_obfuscate
@@ -58,14 +61,14 @@ COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Fix permissions for staging area and user home
-RUN chown -R gemini:gemini /home/gemini /opt/odoo-debug
+RUN chown -R debugger:debugger /home/debugger /opt/odoo-debug
 
 # Define the default internal source directory where the user will mount their repos
 ENV ODOO_SRC_DIR=/source
-RUN mkdir -p /source && chown gemini:gemini /source
+RUN mkdir -p /source && chown debugger:debugger /source
 
 # Switch to the non-root user
-USER gemini
+USER debugger
 
 # Set the working directory
 WORKDIR /source
@@ -73,5 +76,5 @@ WORKDIR /source
 # Set the entrypoint to our setup script
 ENTRYPOINT ["entrypoint.sh"]
 
-# Default command starts interactive Gemini CLI
-CMD ["gemini"]
+# Default command starts interactive Antigravity CLI
+CMD ["agy"]

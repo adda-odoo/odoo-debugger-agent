@@ -1,8 +1,12 @@
 services:
-  sandbox:
+  # Antigravity backend (Google `agy` CLI). Default, backward-compatible.
+  # Launch with: docker compose --profile antigravity run --rm sandbox-antigravity
+  sandbox-antigravity:
+    profiles: ["antigravity"]
     build: .
     image: odoo-debugger-sandbox:latest
     environment:
+      - AGENT_BACKEND=antigravity
       - GOOGLE_CLOUD_PROJECT
       - DB_HOST
       - DB_USER
@@ -10,9 +14,36 @@ services:
       - DB_PASSWORD
     volumes:
       - /var/run/postgresql:/var/run/postgresql
-      - ~/.gemini:/home/gemini/.gemini
+      - ~/.gemini:/home/debugger/.gemini
       - ../:/source
       # Ignore the internal subfolder by mounting an anonymous volume over it
       - /source/internal
     stdin_open: true
     tty: true
+    command: ["agy"]
+
+  # Claude backend (Anthropic `claude` CLI).
+  # Launch with: docker compose --profile claude run --rm sandbox-claude
+  sandbox-claude:
+    profiles: ["claude"]
+    build: .
+    image: odoo-debugger-sandbox:latest
+    environment:
+      - AGENT_BACKEND=claude
+      # Use a DEDICATED Claude config dir so we persist this sandbox's login without
+      # touching (or polluting) the user's real ~/.claude / ~/.claude.json on the host.
+      - CLAUDE_CONFIG_DIR=/home/debugger/.claude-config
+      - DB_HOST
+      - DB_USER
+      - DB_PORT
+      - DB_PASSWORD
+    volumes:
+      - /var/run/postgresql:/var/run/postgresql
+      # Persist the sandbox's Claude login + config across runs (single directory mount).
+      - ~/.odoo-debugger-claude:/home/debugger/.claude-config
+      - ../:/source
+      # Ignore the internal subfolder by mounting an anonymous volume over it
+      - /source/internal
+    stdin_open: true
+    tty: true
+    command: ["claude"]
