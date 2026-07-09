@@ -5,6 +5,7 @@ import csv
 import io
 import logging
 import time
+from pathlib import Path
 
 import psycopg2
 
@@ -229,8 +230,104 @@ def _process_table(
     return total_processed
 
 
+# Categories that should be anonymized when no specific generator matches.
+_PII_CATEGORIES = {
+    "direct_pii",
+    "communication",
+    "authentication",
+    "financial",
+    "business_sensitive",
+    "quasi_identifier",
+    "health",
+    "hr",
+}
+
+
+def _load_pii_csv(csv_path: Path) -> dict[str, dict]:
+    """Load curated PII fields from a version-specific CSV."""
+    results: dict[str, dict] = {}
+    categories: dict[str, str] = {}
+    field_info: dict[str, tuple[str, str, str, str]] = {}
+
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            model = row.get("model", "").strip()
+            field = row.get("field", "").strip()
+            if not model or not field:
+                continue
+
+            table_name = model.replace(".", "_")
+            key = f"{table_name}.{field}"
+
+            field_type = row.get("field_type", "").strip()
+            string = row.get("string", "").strip()
+            help_text = row.get("help", "").strip()
+            category = row.get("category", "").strip()
+
+            # Prefer direct_pii over other categories for duplicate keys.
+            existing = categories.get(key)
+            if existing == "direct_pii" and category != "direct_pii":
+                continue
+            categories[key] = category
+            field_info[key] = (field, field_type, string, help_text)
+
+    for key, category in categories.items():
+        field, field_type, string, help_text = field_info[key]
+        # model_name is rebuilt from the key prefix (table_name) to let the
+        # analyzer's plain-"name" heuristics resolve correctly.
+        table_name, _ = key.split(".", 1)
+        model_name = table_name.replace("_", ".")
+        generator = analyzer.get_generator_for_field(
+            field, field_type, string, help_text, {}, model_name, ""
+        )
+        if generator:
+            props: dict[str, object] = {"type": generator}
+            if generator in {"vat", "barcode", "passport"} or field in {
+                "vat",
+                "barcode",
+                "passport_id",
+                "identification_id",
+                "company_registry",
+                "global_location_number",
+            }:
+                props["unique_suffix"] = True
+            results[key] = props
+        elif category in _PII_CATEGORIES:
+            results[key] = {"type": "clear"}
+
+    # Preserve the same hardcoded overrides used by analyzer.analyze_fields
+    # so cross-table coherence (login/email, name/display_name) stays intact.
+    overrides = {
+        "res_partner.name": {"type": "full_name", "jsonb": True, "coherent_with": "display_name"},
+        "res_partner.display_name": {"type": "full_name", "jsonb": True, "coherent_with": "name"},
+        "res_partner.complete_name": {"type": "full_name", "jsonb": True},
+        "res_partner.company_name": {"type": "company_name", "jsonb": True},
+        "res_partner.email": {"type": "email", "unique_suffix": True},
+        "res_users.login": {"type": "from_partner", "field": "email", "via": "partner_id"},
+        "hr_employee.name": {"type": "full_name", "jsonb": True},
+        "res_company.name": {"type": "company_name", "jsonb": True},
+        "product_template.name": {"type": "product_name", "jsonb": True},
+        "product_product.name": {"type": "product_name", "jsonb": True},
+        "mail_message.body": {"type": "literal", "value": "<p>Anonymized.</p>"},
+        "mail_mail.body_html": {"type": "literal", "value": "<p>Anonymized.</p>"},
+    }
+    results.update(overrides)
+    return results
+
+
 def _build_fields_section(args, manifest: RunManifest) -> dict[str, dict]:
-    """Dynamically analyze fields to build the fields section."""
+    """Dynamically analyze fields to build the fields section.
+
+    If a version-specific curated CSV exists under pii_fields/, it is used
+    instead of scanning addon paths.
+    """
+    odoo_ver = manifest.odoo_ver
+    csv_path = Path(__file__).with_name("pii_fields") / f"sensitive_fields_{odoo_ver}.csv"
+    if csv_path.exists():
+        log.info("Using curated PII fields for Odoo %s: %s", odoo_ver, csv_path)
+        return _load_pii_csv(csv_path)
+
     log.info("Analyzing addons paths for sensitive fields...")
     return analyzer.analyze_fields(args.addons_paths)
 
