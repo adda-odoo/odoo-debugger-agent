@@ -1,4 +1,3 @@
-import analyzer
 import db
 import filestore
 import generators
@@ -8,7 +7,6 @@ import manifest
 import runner
 
 __all__ = [
-    "analyzer",
     "db",
     "filestore",
     "generators",

@@ -3,7 +3,8 @@
 This is an Odoo database obfuscation tool designed for high performance, ease of use, and LLM-compatibility. 
 
 Key Features:
-- **AST Static Analysis:** Automatically discovers sensitive PII fields by parsing Odoo Python source code.
+- **Curated PII Field Lists:** Uses version-specific CSV files (`pii_fields/sensitive_fields_<version>.csv`) to identify sensitive fields.
+- **Standalone Analyzer:** `tools/analyze_pii_fields.py` can scan Odoo addon source code and emit a CSV of candidate PII fields for curation.
 - **Synthetic Data Generation (Faker):** Replaces sensitive data with realistic, fake data (e.g., `John Doe`, `user@anon.example.com`).
 - **High-Speed Execution:** Uses PostgreSQL `COPY` commands into `UNLOGGED` tables, bypassing the ORM for blazing-fast obfuscation of multi-gigabyte databases.
 - **Filestore Scrubbing:** Systematically replaces sensitive PDF and image attachments with blank dummies while preserving UI/theme assets.
@@ -18,12 +19,11 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-./main.py --db <database_name> --addons-paths /path/to/odoo/addons /path/to/enterprise
+./main.py --db <database_name>
 ```
 
 ### Options:
 - `--db DBNAME`: The target PostgreSQL database (using peer authentication).
-- `--addons-paths PATHS`: One or more paths to Odoo addons directories to scan for PII.
 - `--dry-run`: Scans the database and counts rows, but makes no changes.
 - `--filestore PATH`: (Optional) Explicit path to the Odoo filestore. If omitted, the tool auto-detects it.
 - `--force`: Bypass the idempotency guard (allows re-running on an already obfuscated DB).

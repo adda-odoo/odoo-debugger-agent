@@ -4,11 +4,13 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 import time
+from pathlib import Path
 
 import psycopg2
 
-import analyzer, filestore, generators as gen, infra
+import filestore, generators as gen, infra
 from db import column_info, connect, jsonb_keys, odoo_version, pg_version, table_exists
 from identity import PartnerIdentity, build_partner_identities
 from manifest import RunManifest
@@ -229,10 +231,240 @@ def _process_table(
     return total_processed
 
 
+# Categories that should be anonymized when no specific generator matches.
+_PII_CATEGORIES = {
+    "direct_pii",
+    "communication",
+    "authentication",
+    "financial",
+    "business_sensitive",
+    "quasi_identifier",
+    "health",
+    "hr",
+}
+
+# Field types that can carry meaningful sensitive text/data.
+_TEXT_TYPES = {"Char", "Text", "Html", "Binary", "Json"}
+
+# Field-name patterns that map to generator types. Each entry is
+# (regex, generator_type, requires_text_type).
+_FIELD_PATTERNS = [
+    # Names
+    (r"^(company_name|commercial_company_name)$", "company_name", False),
+    (r"^(complete_name|display_name|legal_name|contact_name|partner_name|full_name|first_name|last_name|middle_name|maiden_name|nickname|alias)$", "full_name", False),
+
+    # Contact
+    (r"^(email|private_email|work_email|personal_email|emergency_email)$", "email", False),
+    (r"^(phone|mobile|fax|private_phone|private_mobile|work_phone|work_mobile|personal_phone|personal_mobile|home_phone|emergency_phone|emergency_mobile)$", "phone", False),
+    (r"^(street|address|contact_address|formatted_address|postal_address|delivery_address|invoice_address|home_address|emergency_address)$", "street", False),
+    (r"^(street2)$", "street2", False),
+    (r"^(zip|postal_code|postcode)$", "zip", False),
+    (r"^city$", "city", False),
+
+    # Identifiers
+    (r"^(vat|tax_id|vat_number|tin)$", "vat", False),
+    (r"^(ssn|sin|social_security|social_security_number)$", "ssn", False),
+    (r"^(passport|passport_id|passport_number)$", "passport", False),
+    (r"^(barcode|qrcode|rfid|ean|upc)$", "barcode", False),
+    (r"^(company_registry|registry_number|chamber_of_commerce|commercial_register|trade_register|duns)$", "alphanum", False),
+    (r"^(drivers_license|driver_license|id_card|id_number|identification_id|identity_number|national_id_number|citizen_id|resident_id)$", "alphanum", False),
+
+    # Dates
+    (r"^(birthday|birthdate|date_of_birth|dob|date_birth)$", "date_shift", False),
+
+    # URLs
+    (r"^(website|linkedin|twitter|facebook|social_media|skype|whatsapp|telegram|instagram|youtube|github|gitlab|map_url|map_link)$", "website", False),
+
+    # Financial
+    (r"^(bank_account|acc_number|account_number|sanitized_acc_number|routing_number|sort_code|clearing_number|bank_code|branch_code)$", "iban", False),
+    (r"^(iban|iban_number)$", "iban", False),
+    (r"^(bic|swift|bank_bic|swift_code)$", "alphanum", False),
+    (r"^(acc_holder_name|account_holder|holder_name|bank_account_name)$", "full_name", False),
+
+    # Secrets
+    (r"^(password|passwd|pwd|new_password|old_password|confirm_password|current_password|reset_password|temp_password|user_password|smtp_pass|imap_pass|pop_pass|ftp_pass|db_password|db_pass|admin_pass|root_password|ldap_password|oauth_password|proxy_password|vpn_password|wifi_password|sip_password)$", "clear", False),
+    (r"^(token|access_token|refresh_token|auth_token|api_token|csrf_token|verification_token|reset_token|invite_token|share_token|download_token|preview_token|unsubscribe_token|sync_token|session_token|id_token|oauth_token|bearer_token)$", "clear", False),
+    (r"^(api_key|api_key_id|api_secret|secret_key|client_secret|app_secret|consumer_secret|shared_secret|signing_secret|webhook_secret)$", "clear", False),
+    (r"^(private_key|public_key|ssl_key|ssh_key|pgp_key|gpg_key|ssl_certificate|tls_certificate|client_certificate|server_certificate|signing_certificate|code_signing_certificate|cert_pem|certificate_pem|cert_file|certificate_file|x509_certificate|x509_cert|public_cert|private_cert|pem|csr|x509|rsa_key|ecdsa_key|ed25519_key|dsa_key|dh_key|symmetric_key|aes_key|des_key)$", "clear", False),
+    (r"^(credential|credentials|auth_code|oauth_code|authorization_code|session_id|session_key|cookie|csrf|nonce|challenge|otp|totp_secret|hotp_secret|seed|recovery_code|backup_code|pin|pin_code|passcode)$", "clear", False),
+
+    # Images
+    (r"^(avatar|image|image_1920|image_128|image_1024|image_512|image_256|photo|portrait|selfie|signature|sign|digital_signature)$", "clear", False),
+
+    # Text / Communication
+    (r"^(body|message|note|notes|internal_notes|memo|description|desc|comment|comments|feedback|reason|justification|narration|observation|finding|diagnosis|remark|remarks|annotation|transcript|dialogue|conversation|chat|thread)$", "clear", True),
+    (r"^(subject|email_subject|title|email_from|reply_to|reply_to_address|sender|sender_address|sender_email|recipient|recipient_address|to_address|cc|bcc|sent_to|sent_from|originator|return_path|envelope_from|mail_from|rcpt_to)$", "clear", False),
+    (r"^(old_value_char|old_value_text|old_value_datetime|old_value_integer|old_value_float|new_value_char|new_value_text|new_value_datetime|new_value_integer|new_value_float)$", "clear", False),
+
+    # Other IP / geo
+    (r"^(ip_address|ip|remote_ip|client_ip|user_agent|browser|device_id|mac_address|imei|serial_number|fingerprint)$", "clear", False),
+    (r"^(latitude|longitude|geo|gps|partner_latitude|partner_longitude|location|geo_location|geolocation|coordinates|coordinate|lat|lng|long)$", "clear", False),
+]
+
+_PERSON_MODELS = {
+    r"res\.partner", r"res\.users", r"hr\.employee", r"hr\.applicant", r"hr\.candidate",
+    r"crm\.lead", r"event\.registration", r"event\.attendee", r"mailing\.contact",
+    r"res\.partner\.bank", r"portal\.wizard\.user", r"auth\.totp\.wizard",
+    r"mail\.followers", r"mail\.alias", r"res\.users\.apikeys", r"res\.users\.deletion",
+    r"gamification\.badge\.user", r"website\.visitor", r"slide\.slide",
+    r"survey\.user_input", r"calendar\.attendee", r"project\.task",
+    r"resource\.resource",
+}
+
+_DOCUMENT_MODELS = {
+    r"sale\.order", r"purchase\.order", r"account\.move", r"account\.invoice",
+    r"project\.project", r"project\.task", r"helpdesk\.ticket", r"event\.event",
+    r"mrp\.production", r"stock\.picking", r"stock\.move", r"pos\.order",
+    r"repair\.order", r"subscription\.order", r"fleet\.vehicle", r"fleet\.vehicle\.log",
+    r"maintenance\.request", r"quality\.check", r"mrp\.workorder",
+}
+
+
+def _model_matches(model_name: str, patterns: set[str]) -> bool:
+    for pattern in patterns:
+        if re.search(pattern, model_name):
+            return True
+    return False
+
+
+def _get_generator_for_field(
+    field_name: str,
+    field_type: str,
+    string_val: str,
+    help_val: str,
+    model_name: str,
+    comodel_name: str = "",
+) -> str | None:
+    """Return a generator type for a field based on name/type heuristics.
+
+    This is the same heuristic previously provided by analyzer.py so that
+    curated CSV files without an explicit generator column can still be
+    converted into obfuscation instructions.
+    """
+    # 1. Explicit field name patterns
+    for pattern, generator_type, req_text in _FIELD_PATTERNS:
+        if re.search(pattern, field_name, re.IGNORECASE):
+            if req_text and field_type not in _TEXT_TYPES:
+                continue
+            return generator_type
+
+    # 2. Special handling for plain "name" field
+    if field_name == "name":
+        if _model_matches(model_name, _PERSON_MODELS):
+            return "full_name"
+        if _model_matches(model_name, _DOCUMENT_MODELS):
+            return "alphanum"
+        if string_val and re.search(r"\b(name|nom|nombre|naam)\b", string_val, re.IGNORECASE):
+            return "full_name"
+
+    # 3. Relational fields pointing to person models
+    if field_type in ("Many2one", "One2many", "Many2many") and comodel_name:
+        if _model_matches(comodel_name, _PERSON_MODELS):
+            return "clear"
+
+    # 4. Text and HTML types without matches are typically notes/descriptions
+    if field_type in ("Html", "Text"):
+        return "clear"
+
+    # 5. Fallback for explicit binary
+    if field_type == "Binary":
+        return "clear"
+
+    return None
+
+
+def _load_pii_csv(csv_path: Path) -> dict[str, dict]:
+    """Load curated PII fields from a version-specific CSV."""
+    results: dict[str, dict] = {}
+    categories: dict[str, str] = {}
+    field_info: dict[str, tuple[str, str, str, str]] = {}
+
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            model = row.get("model", "").strip()
+            field = row.get("field", "").strip()
+            if not model or not field:
+                continue
+
+            table_name = model.replace(".", "_")
+            key = f"{table_name}.{field}"
+
+            field_type = row.get("field_type", "").strip()
+            string = row.get("string", "").strip()
+            help_text = row.get("help", "").strip()
+            category = row.get("category", "").strip()
+
+            # Prefer direct_pii over other categories for duplicate keys.
+            existing = categories.get(key)
+            if existing == "direct_pii" and category != "direct_pii":
+                continue
+            categories[key] = category
+            field_info[key] = (field, field_type, string, help_text)
+
+    for key, category in categories.items():
+        field, field_type, string, help_text = field_info[key]
+        # model_name is rebuilt from the key prefix (table_name) so the
+        # plain-"name" heuristics in _get_generator_for_field resolve correctly.
+        table_name, _ = key.split(".", 1)
+        model_name = table_name.replace("_", ".")
+        generator = _get_generator_for_field(
+            field, field_type, string, help_text, model_name, ""
+        )
+        if generator:
+            props: dict[str, object] = {"type": generator}
+            if generator in {"vat", "barcode", "passport"} or field in {
+                "vat",
+                "barcode",
+                "passport_id",
+                "identification_id",
+                "company_registry",
+                "global_location_number",
+            }:
+                props["unique_suffix"] = True
+            results[key] = props
+        elif category in _PII_CATEGORIES:
+            results[key] = {"type": "clear"}
+
+    # Hardcoded overrides so cross-table coherence (login/email, name/display_name)
+    # stays intact. These used to live in analyzer.py.
+    overrides = {
+        "res_partner.name": {"type": "full_name", "jsonb": True, "coherent_with": "display_name"},
+        "res_partner.display_name": {"type": "full_name", "jsonb": True, "coherent_with": "name"},
+        "res_partner.complete_name": {"type": "full_name", "jsonb": True},
+        "res_partner.company_name": {"type": "company_name", "jsonb": True},
+        "res_partner.email": {"type": "email", "unique_suffix": True},
+        "res_users.login": {"type": "from_partner", "field": "email", "via": "partner_id"},
+        "hr_employee.name": {"type": "full_name", "jsonb": True},
+        "res_company.name": {"type": "company_name", "jsonb": True},
+        "product_template.name": {"type": "product_name", "jsonb": True},
+        "product_product.name": {"type": "product_name", "jsonb": True},
+        "mail_message.body": {"type": "literal", "value": "<p>Anonymized.</p>"},
+        "mail_mail.body_html": {"type": "literal", "value": "<p>Anonymized.</p>"},
+    }
+    results.update(overrides)
+    return results
+
+
 def _build_fields_section(args, manifest: RunManifest) -> dict[str, dict]:
-    """Dynamically analyze fields to build the fields section."""
-    log.info("Analyzing addons paths for sensitive fields...")
-    return analyzer.analyze_fields(args.addons_paths)
+    """Load the curated PII fields section for the current Odoo version.
+
+    Obfuscation is strictly CSV-driven. A version-specific CSV must exist
+    under pii_fields/; the previous AST-based analyzer is now a standalone
+    script (tools/analyze_pii_fields.py) that can be used to generate or
+    refresh these CSVs.
+    """
+    odoo_ver = manifest.odoo_ver
+    csv_path = Path(__file__).with_name("pii_fields") / f"sensitive_fields_{odoo_ver}.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"No curated PII fields CSV found for Odoo {odoo_ver}: {csv_path}. "
+            "Use tools/analyze_pii_fields.py to generate one, or provide a "
+            "suitable CSV in the pii_fields/ directory."
+        )
+
+    log.info("Using curated PII fields for Odoo %s: %s", odoo_ver, csv_path)
+    return _load_pii_csv(csv_path)
 
 
 def run_anonymize(args) -> None:

@@ -16,11 +16,6 @@ def build_parser() -> argparse.ArgumentParser:
     db_group.add_argument("--db", metavar="DBNAME", help="Local database name (peer auth)")
     db_group.add_argument("--db-url", metavar="URL", help="Full PostgreSQL connection URL")
 
-    parser.add_argument(
-        "--addons-paths", nargs="+", required=True,
-        help="Paths to Odoo addons directories (e.g. odoo/addons, enterprise, my_addons) to analyze for PII fields."
-    )
-    
     parser.add_argument("--dry-run", action="store_true", help="Report changes without writing.")
     parser.add_argument("--force", action="store_true", help="Bypass idempotency guard.")
     parser.add_argument("--filestore", metavar="PATH", help="Path to Odoo filestore directory.")
