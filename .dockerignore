@@ -1,0 +1,10 @@
+# Stale build/test artifacts from host-side development — never part of the
+# image; leaving them out of the build context also means editing them can't
+# accidentally bust the Docker layer cache for unrelated COPY steps.
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/build/
+**/*.egg-info/
+**/.mypy_cache/
+**/.ruff_cache/

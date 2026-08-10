@@ -1,75 +1,68 @@
 #!/bin/bash
-# entrypoint.sh - Automated setup for Odoo Debugger Agent
-#
-# Supports two interchangeable backends, selected via the AGENT_BACKEND env var:
-#   - antigravity : Google's Antigravity CLI (`agy`)   [default, for backward-compat]
-#   - claude      : Claude Code CLI (`claude`)
+# entrypoint.sh - Automated setup for Odoo Debugger Agent (Claude Code backend)
 
 echo "--- Odoo Debugger Environment Setup ---"
 
 # Ensure we have a valid HOME
 export HOME=/home/debugger
-USER_HOME="/home/debugger"
 STAGING_DIR="/opt/odoo-debug"
-AGENT_BACKEND="${AGENT_BACKEND:-antigravity}"
 
-echo "Selected backend: $AGENT_BACKEND"
+# The container starts as root because the host's bind-mounted volumes
+# (the CLAUDE_CONFIG_DIR mount, and ../:/source) are owned by whatever UID
+# the host user has, which generally does not match this image's fixed
+# `debugger` UID (1000) — Docker also auto-creates a missing bind-mount
+# source as root:root, which would otherwise leave it unwritable by
+# `debugger` forever. Chown just those two mount points, then drop to
+# `debugger` for everything else. The actual Claude Code session must never
+# run as root.
+if [ "$(id -u)" = "0" ]; then
+    CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude-config}"
+    mkdir -p "$CONFIG_DIR"
+    chown -R debugger:debugger "$CONFIG_DIR"
+    mkdir -p /source/.claude
+    chown -R debugger:debugger /source/.claude
 
-deploy_antigravity() {
-    ANTIGRAVITY_CONFIG_DIR="$USER_HOME/.gemini/antigravity-cli"
-    AGENTS_DIR="$ANTIGRAVITY_CONFIG_DIR/agents"
-    GLOBAL_SKILLS_DIR="$ANTIGRAVITY_CONFIG_DIR/skills"
-
-    # 1. Create necessary directories
-    mkdir -p "$AGENTS_DIR"
-    mkdir -p "$GLOBAL_SKILLS_DIR"
-
-    # 2. Deploy the Agent definition
-    echo "Deploying @odoo-debugger agent..."
-    if [ -f "$STAGING_DIR/agents/odoo-debugger/agent.json" ]; then
-        mkdir -p "$AGENTS_DIR/odoo-debugger"
-        cp "$STAGING_DIR/agents/odoo-debugger/agent.json" "$AGENTS_DIR/odoo-debugger/"
-        echo "  [OK] Agent definition deployed."
+    # odoo-bin's own shebang (`#!/usr/bin/env python3`) resolves to this
+    # image's system python3, which starts out with only the MCP server's
+    # own deps installed, not Odoo's (werkzeug, babel, lxml, gevent, ...) —
+    # start_odoo/attach_debugger crash immediately, before Odoo's own
+    # logging even initializes, without this. debian/control (Odoo's own
+    # dependency manifest, read by setup/debinstall.sh below) only exists
+    # once /source is mounted at container start, not at image build time,
+    # so this can't be baked into the Dockerfile — it has to run here, every
+    # session. Using Odoo's own debinstall.sh (apt packages) rather than
+    # `pip install -r requirements.txt` matters: the pip-pinned equivalent of
+    # some of these (gevent in particular) has no prebuilt wheel for this
+    # Python/platform and fails compiling from source, where the apt package
+    # is prebuilt for this exact Ubuntu release — this is the same install
+    # path Odoo's own .deb packaging uses.
+    if [ -f /source/odoo/setup/debinstall.sh ]; then
+        sh /source/odoo/setup/debinstall.sh -q
+    else
+        echo "  [WARN] /source/odoo/setup/debinstall.sh not found — skipping Odoo dependency install."
     fi
 
-    # 3. Deploy Skills
-    # We deploy to the standard global location and workspace location.
-    # If ~/.gemini is mounted, the global one stays persistent.
-    echo "Deploying Odoo debugger skills..."
-    if [ -d "$STAGING_DIR/skills/odoo-debugger" ]; then
-        mkdir -p "$GLOBAL_SKILLS_DIR"
-        mkdir -p "/source/.agents/skills"
-        cp -r "$STAGING_DIR/skills/odoo-debugger" "$GLOBAL_SKILLS_DIR/"
-        cp -r "$STAGING_DIR/skills/odoo-debugger" "/source/.agents/skills/"
-        echo "  [OK] Skills deployed to $GLOBAL_SKILLS_DIR and /source/.agents/skills"
-    fi
+    exec setpriv --reuid=debugger --regid=debugger --init-groups "$0" "$@"
+fi
 
-    # 4. Register and Enable MCP Server
-    echo "Configuring odoo-debug MCP server..."
-    python3 -c "
-import os, json
-agents_dir = '/source/.agents'
-os.makedirs(agents_dir, exist_ok=True)
-config_path = os.path.join(agents_dir, 'mcp_config.json')
-config = {'mcpServers': {}}
-if os.path.exists(config_path):
-    try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-    except Exception:
-        pass
-if 'mcpServers' not in config:
-    config['mcpServers'] = {}
-config['mcpServers']['odoo-debug'] = {
-    'command': '/usr/bin/python3',
-    'args': ['/opt/odoo-debug/debug_server.py']
-}
-with open(config_path, 'w') as f:
-    json.dump(config, f, indent=2)
-"
-    echo "  [OK] MCP server registered in workspace scope."
-    echo "Config folder: $AGENTS_DIR"
-}
+# The odoo/enterprise checkouts under /source are bind-mounted from the host
+# and keep the host user's ownership (unlike the CLAUDE_CONFIG_DIR/.claude
+# mounts above, chowning these on every start would be slow and would flip
+# ownership away from the host user for no benefit). Git's ownership check
+# then flags them as "dubious" for the debugger user — trust everything
+# under /source instead, since that's the whole point of this sandbox.
+git config --global --add safe.directory '*'
+
+# PostgreSQL connection (standard libpq env vars). debug_server.py, the
+# oe-support restore pipeline (createdb/dropdb/pg_restore), and the scrubdb
+# CLI all resolve their Postgres target from these — set once, here, so
+# every code path stays uniformly pointed at the dedicated cluster. Fixed,
+# not user-configurable: the isolation guarantee comes from the host's
+# ufw/pg_hba scoping to this exact port, not from hiding it.
+export PGHOST="host.docker.internal"
+export PGPORT="5433"
+export PGUSER="odoo"
+export PGPASSWORD="odoo"
 
 deploy_claude() {
     # Claude Code reads project config from the working directory (/source).
@@ -80,22 +73,26 @@ deploy_claude() {
     # 1. Deploy the subagent (flat markdown file).
     echo "Deploying odoo-debugger subagent..."
     if [ -f "$STAGING_DIR/agents/odoo-debugger/odoo-debugger.md" ]; then
-        mkdir -p "$CLAUDE_AGENTS_DIR"
-        cp "$STAGING_DIR/agents/odoo-debugger/odoo-debugger.md" "$CLAUDE_AGENTS_DIR/odoo-debugger.md"
-        echo "  [OK] Subagent deployed to $CLAUDE_AGENTS_DIR"
+        if mkdir -p "$CLAUDE_AGENTS_DIR" && cp "$STAGING_DIR/agents/odoo-debugger/odoo-debugger.md" "$CLAUDE_AGENTS_DIR/odoo-debugger.md"; then
+            echo "  [OK] Subagent deployed to $CLAUDE_AGENTS_DIR"
+        else
+            echo "  [WARN] Failed to deploy subagent to $CLAUDE_AGENTS_DIR (check mount permissions)"
+        fi
     fi
 
     # 2. Deploy Skills (idempotent overwrite so they are always current).
     echo "Deploying Odoo debugger skills..."
     if [ -d "$STAGING_DIR/skills/odoo-debugger" ]; then
-        mkdir -p "$CLAUDE_SKILLS_DIR"
-        cp -r "$STAGING_DIR/skills/odoo-debugger" "$CLAUDE_SKILLS_DIR/"
-        echo "  [OK] Skills deployed to $CLAUDE_SKILLS_DIR"
+        if mkdir -p "$CLAUDE_SKILLS_DIR" && cp -r "$STAGING_DIR/skills/odoo-debugger" "$CLAUDE_SKILLS_DIR/"; then
+            echo "  [OK] Skills deployed to $CLAUDE_SKILLS_DIR"
+        else
+            echo "  [WARN] Failed to deploy skills to $CLAUDE_SKILLS_DIR (check mount permissions)"
+        fi
     fi
 
     # 3. Pre-allow the odoo-debug MCP tools in workspace settings so the subagent
-    #    doesn't prompt on every tool call (mirrors the frictionless Antigravity UX).
-    #    Merge-safe: preserve any existing settings.local.json.
+    #    doesn't prompt on every tool call. Merge-safe: preserve any existing
+    #    settings.local.json.
     echo "Pre-allowing odoo-debug tools in workspace settings..."
     python3 -c "
 import os, json
@@ -116,7 +113,11 @@ if 'mcp__odoo-debug__*' not in allow:
 with open(path, 'w') as f:
     json.dump(settings, f, indent=2)
 "
-    echo "  [OK] Workspace permissions updated."
+    if [ $? -eq 0 ]; then
+        echo "  [OK] Workspace permissions updated."
+    else
+        echo "  [WARN] Failed to update workspace permissions (check mount permissions)"
+    fi
 
     # 4. Auto-register the MCP server at user scope (auto-trusted; persists in the
     #    dedicated CLAUDE_CONFIG_DIR so no per-launch trust prompt is needed). Idempotent.
@@ -129,18 +130,7 @@ with open(path, 'w') as f:
     fi
 }
 
-case "$AGENT_BACKEND" in
-    claude)
-        deploy_claude
-        ;;
-    antigravity)
-        deploy_antigravity
-        ;;
-    *)
-        echo "  [WARN] Unknown AGENT_BACKEND '$AGENT_BACKEND'; defaulting to antigravity."
-        deploy_antigravity
-        ;;
-esac
+deploy_claude
 
 # Check for previous crash logs
 if [ -f "/tmp/odoo_mcp_error.log" ]; then

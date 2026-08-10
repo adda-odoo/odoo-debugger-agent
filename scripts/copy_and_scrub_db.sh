@@ -1,0 +1,77 @@
+#!/bin/bash
+# Copies <db_name> from the host's main Postgres cluster into the ai-dev
+# cluster and runs scrubdb against the copy, marking it clean only if a
+# structural diff against the main original (verify_scrub_diff.py) confirms
+# every column scrubdb touched actually changed and no table's row count
+# drifted unexpectedly. Called from start.sh, which has already confirmed
+# the database isn't already present-and-marked on ai-dev — this script does
+# not re-check that itself.
+set -euo pipefail
+
+DB_NAME="$1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SRC_HOST=/var/run/postgresql
+SRC_PORT=5432
+SRC_USER=odoo
+
+DST_HOST=/var/run/postgresql
+DST_PORT=5433
+DST_USER=odoo
+
+REPORT_DIR="${HOME}/.scrubdb-reports"
+mkdir -p "$REPORT_DIR"
+REPORT_PATH="${REPORT_DIR}/${DB_NAME}_$(date +%s).json"
+DIFF_REPORT_PATH="${REPORT_DIR}/${DB_NAME}_$(date +%s)_diff.json"
+
+DUMP_FILE="$(mktemp --suffix=.dump)"
+trap 'rm -f "$DUMP_FILE"' EXIT
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+for bin in pg_dump pg_restore createdb dropdb psql scrubdb python3; do
+    command -v "$bin" >/dev/null || { echo "Missing required host tool: $bin (see README prerequisites)" >&2; exit 1; }
+done
+
+psql -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_USER" -d postgres -tAc \
+    "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 \
+    || { echo "Source database '$DB_NAME' not found on main (port $SRC_PORT)" >&2; exit 1; }
+
+log "Creating '$DB_NAME' on ai-dev..."
+createdb -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" "$DB_NAME" \
+    --encoding unicode --template template0 --lc-collate C --lc-ctype C
+
+log "Dumping '$DB_NAME' from main..."
+pg_dump -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_USER" -Fc -f "$DUMP_FILE" "$DB_NAME"
+
+log "Restoring into ai-dev..."
+pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" \
+    --no-owner --no-privileges -j 4 "$DUMP_FILE"
+
+log "Running scrubdb (apply)..."
+PGHOST="$DST_HOST" PGPORT="$DST_PORT" PGUSER="$DST_USER" \
+    scrubdb "$DB_NAME" --apply --i-confirm-this-is-a-copy --report "$REPORT_PATH" \
+    --exclude-file "$SCRIPT_DIR/scrub_allowlist.txt"
+
+log "Running structural diff check (main vs ai-dev)..."
+set +e
+python3 "$SCRIPT_DIR/verify_scrub_diff.py" \
+    --db "$DB_NAME" --report "$REPORT_PATH" \
+    --src-host "$SRC_HOST" --src-port "$SRC_PORT" --src-user "$SRC_USER" \
+    --dst-host "$DST_HOST" --dst-port "$DST_PORT" --dst-user "$DST_USER" \
+    --diff-report "$DIFF_REPORT_PATH"
+DIFF_EXIT=$?
+set -e
+
+if [ "$DIFF_EXIT" -eq 0 ]; then
+    psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" -c "
+        INSERT INTO ir_config_parameter (key, value) VALUES ('scrubdb.run_completed', 'true')
+        ON CONFLICT (key) DO UPDATE SET value = 'true';
+    "
+    log "Done. '$DB_NAME' is clean and marked on ai-dev. Diff report: $DIFF_REPORT_PATH"
+else
+    log "Structural diff check failed (exit=$DIFF_EXIT) — dropping '$DB_NAME' from ai-dev."
+    dropdb -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" --if-exists "$DB_NAME"
+    log "Dropped. Diff report kept for review: $DIFF_REPORT_PATH"
+    exit 1
+fi

@@ -6,7 +6,6 @@ import json
 import socket
 import time
 from datetime import datetime
-from urllib.parse import urlparse
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -48,16 +47,50 @@ ODOO_ADDONS = ",".join(addons_paths)
 
 # 4. Resolve internal script locations
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OBFUSCATE_SCRIPT = os.path.join("/opt/odoo-debug", "odoo_obfuscate", "main.py")
-OE_SUPPORT_SCRIPT = os.path.join(src_dir, "support-tools", "oe-support.py")
+SCRUBDB_BIN = "scrubdb"
+SCRUBDB_MARKER_KEY = "scrubdb.run_completed"
+VERIFY_SCRUB_DIFF_SCRIPT = os.path.join("/opt/odoo-debug", "verify_scrub_diff.py")
 
-DB_HOST = "/var/run/postgresql"  # Unix socket — peer auth, no password needed
-DB_USER = "odoo"
 DEBUGPY_PORT = 5678
 LOG_FILE = "/tmp/odoo_server.log"
 ODOO_URL = "http://localhost:8069"
 ODOO_LOGIN = "admin"
 ODOO_PASSWORD = "admin"
+
+# entrypoint.sh apt-installs Odoo's own deps (debian/control, via
+# setup/debinstall.sh) into /usr/lib/python3/dist-packages. Python's default
+# sys.path puts /usr/local/lib/python3.10/dist-packages (pip installs) ahead
+# of that, so a pip package pulled in for the MCP server itself — cryptography
+# is one, transitively — silently shadows the apt version. pyOpenSSL (also
+# apt-installed, imported by odoo/addons/base) is built against the apt
+# cryptography's internal layout, so under the shadowed version it breaks
+# with an unrelated-looking AttributeError deep inside module loading.
+# Prepending this to PYTHONPATH for the odoo-bin/debugpy child only restores
+# apt's priority without touching what the MCP server process itself sees.
+_ODOO_PYTHONPATH = "/usr/lib/python3/dist-packages"
+
+
+def _odoo_subprocess_env() -> dict:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _ODOO_PYTHONPATH + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    return env
+
+
+def _db_connect(database: str, readonly: bool = True):
+    """Connect to `database` on the dedicated PostgreSQL cluster.
+
+    Resolves the target purely from standard libpq env vars (PGHOST/PGPORT/
+    PGUSER/PGPASSWORD), exported once in entrypoint.sh — nothing is hardcoded
+    here, so this, the oe-support restore pipeline, and the scrubdb CLI all
+    stay pointed at the same cluster automatically.
+    """
+    conn = psycopg2.connect(dbname=database)
+    if readonly:
+        conn.set_session(readonly=True)
+    return conn
+
 
 mcp = FastMCP("odoo-debug")
 
@@ -67,6 +100,7 @@ _state: dict = {
     "http_sessions": {},        # dict[str, requests.Session] keyed by database
     "dap": None,                # DAPClient | None
     "memray_pid": None,         # int | None — PID currently being tracked by memray attach
+    "log_file": LOG_FILE,       # str — path passed via the most recent start_odoo call
 }
 
 
@@ -271,28 +305,27 @@ def _call_kw(database: str, model: str, method: str, args: list = None, kwargs: 
 # MCP tools — process management
 # ===========================================================================
 
-_ACCESS_DENIED = "Access denied: '{}' has not been obfuscated. Call obfuscate_database first."
+_ACCESS_DENIED = "Access denied: '{}' has not been confirmed anonymized. Call scrub_database first."
 
 
 @mcp.tool()
 def query_psql(database: str, sql: str, limit: int = 200) -> str:
     """Execute a read-only SQL query against a local Odoo database.
-    
-    Limited to 'limit' rows to make context usage more efficient 
+
+    Limited to 'limit' rows to make context usage more efficient
 
     Args:
         database: Database name (e.g. 'odoo', 'adi')
         sql: SQL query to execute (SELECT only)
         limit: limit the max number of rows to return (default max 200)
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     sql_stripped = sql.strip().upper()
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         return "Error: only SELECT queries are allowed."
     try:
-        conn = psycopg2.connect(host=DB_HOST, user=DB_USER, dbname=database)
-        conn.set_session(readonly=True)
+        conn = _db_connect(database)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql)
             rows = cur.fetchall() 
@@ -320,11 +353,10 @@ def get_odoo_version(database: str) -> str:
     Args:
         database: Database name
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     try:
-        conn = psycopg2.connect(host=DB_HOST, user=DB_USER, dbname=database)
-        conn.set_session(readonly=True)
+        conn = _db_connect(database)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT latest_version FROM ir_module_module WHERE name = 'base'"
@@ -368,13 +400,22 @@ def switch_odoo_branch(branch: str) -> str:
     return "\n".join(lines)
 
 
-def _is_obfuscated(database: str) -> bool:
-    """Return True if the database has been obfuscated via obfuscate_database."""
+def _is_scrubbed(database: str) -> bool:
+    """Return True if the database has a confirmed-clean scrub.
+
+    The marker is written either by the host-side start.sh/
+    copy_and_scrub_db.sh pipeline (the normal path — a database usually
+    arrives here already scrubbed, before the container even starts) or by
+    scrub_database below as an in-container fallback. Both write it only
+    after the same structural clean/dirty diff check comes back clean, so
+    this checks for a *confirmed* anonymization, not merely an attempted one.
+    """
     try:
-        conn = psycopg2.connect(host=DB_HOST, user=DB_USER, dbname=database)
-        conn.set_session(readonly=True)
+        conn = _db_connect(database)
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM ir_config_parameter WHERE key = 'anon_tool.run_completed'")
+            cur.execute(
+                "SELECT 1 FROM ir_config_parameter WHERE key = %s", (SCRUBDB_MARKER_KEY,)
+            )
             found = cur.fetchone() is not None
         conn.close()
         return found
@@ -382,71 +423,162 @@ def _is_obfuscated(database: str) -> bool:
         return False
 
 
-@mcp.tool()
-def fetch_database(url: str, filestore: bool = False) -> str:
-    """Fetch an Odoo SaaS database to this machine using oe-support fetch.
-
-    Derives the database name from the URL hostname (e.g. 'mycompany' from
-    'https://mycompany.odoo.com'). Always passes --no-start and --no-checkout
-    since the agent manages the server and branch separately.
-
-    Call obfuscate_database on the result before using any other tool on it.
-
-    Args:
-        url: Odoo instance URL (e.g. 'https://mycompany.odoo.com')
-        filestore: Also download the filestore (default False)
-    """
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    hostname = parsed.hostname or ""
-    database = hostname.split(".")[0] if hostname else url
-
-    cmd = [
-        sys.executable, OE_SUPPORT_SCRIPT,
-        "fetch", database,
-        "--no-start",
-        "--no-checkout",
-    ]
-    if filestore:
-        cmd.append("--filestore")
-
+def _run(cmd, timeout):
+    """subprocess.run wrapper that turns a timeout into a normal failed result."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    except subprocess.TimeoutExpired:
-        return "Error: fetch timed out after 1 hour."
-
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode != 0:
-        return f"Fetch failed (exit {result.returncode}):\n{output}"
-    return f"Database '{database}' fetched. Call obfuscate_database before accessing it.\n{output}"
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
 
 
 @mcp.tool()
-def obfuscate_database(database: str, version: str, pwd: str = "") -> str:
-    """Obfuscate PII fields in an Odoo database using the Smart Synthetic Obfuscator.
+def scrub_database(database: str) -> str:
+    """Anonymize an Odoo database in place using scrubdb, then confirm it's clean.
 
-    Must be called before any other tool accesses the database.
-    
+    Must be called before any other tool accesses the database — it's the
+    only way to satisfy the gate those tools enforce. This is the fallback
+    for a database that reached this cluster without already being scrubbed
+    by the host-side start.sh/copy_and_scrub_db.sh pipeline (which normally
+    handles it before the container ever starts) — e.g. one restored here by
+    some other means.
+
+    scrubdb's masking is one-way (the run key is discarded, nothing is
+    reversible), so before touching the real database this snapshots its
+    current state into a throwaway same-cluster copy, scrubs the real
+    database in place, then structurally diffs the scrubbed result against
+    that snapshot — every column scrubdb touched must have actually changed
+    (the same clean/dirty check copy_and_scrub_db.sh uses on the host). The
+    "confirmed anonymized" marker other tools check for is only written if
+    that comes back clean; if not, the database is left scrubbed but NOT
+    marked confirmed, and this returns the findings instead. The throwaway
+    snapshot is always dropped afterward — only the real database's fate is
+    reported.
+
     Args:
-        database: Database name
-        version: Odoo version (e.g. '17.0', '18.0') (Currently ignored by the new tool, but kept for signature compatibility)
-        pwd: (Ignored by the new tool, kept for signature compatibility)
+        database: Database name (must already exist on this cluster —
+                  scrubdb rewrites it in place)
     """
-    cmd = [
-        "python3", OBFUSCATE_SCRIPT,
-        "--db", database,
-        "--addons-paths", f"{ODOO_REPO}/addons", f"{ODOO_REPO}/odoo/addons", ENTERPRISE_REPO
-    ]
-        
-    env = os.environ.copy()
+    ts = int(time.time())
+    tmp_db = f"_scrubdb_verify_{database}_{ts}"
+    dump_path = f"/tmp/scrubdb_predump_{database}_{ts}.dump"
+    report_path = f"/tmp/scrubdb_report_{database}_{ts}.json"
+    diff_report_path = f"/tmp/scrubdb_diff_{database}_{ts}.json"
+
+    def _drop_tmp() -> bool:
+        # A connection closed by a subprocess that just exited (verify_scrub_diff.py)
+        # can take Postgres a moment to notice — retry briefly rather than
+        # leaking the throwaway copy on a race.
+        for attempt in range(5):
+            if _run(["dropdb", "--if-exists", tmp_db], timeout=60).returncode == 0:
+                return True
+            time.sleep(1)
+        return False
+
+    # 1. Snapshot the pre-scrub state — the only reference left to verify
+    #    against once the real database is scrubbed in place. Dump+restore
+    #    rather than CREATE DATABASE ... TEMPLATE, since the latter requires
+    #    zero other connections to the source at the moment of copy.
+    dump = _run(["pg_dump", "-Fc", "-f", dump_path, database], timeout=1800)
+    if dump.returncode != 0:
+        return f"scrub_database failed to snapshot '{database}' for verification:\n{dump.stderr}"
+    create = _run(["createdb", tmp_db, "--encoding", "unicode", "--template", "template0",
+                   "--lc-collate", "C", "--lc-ctype", "C"], timeout=60)
+    if create.returncode != 0:
+        os.remove(dump_path)
+        return f"scrub_database failed to create a verification copy of '{database}':\n{create.stderr}"
+    restore = _run(["pg_restore", "-d", tmp_db, "--no-owner", "--no-privileges", "-j", "4", dump_path],
+                    timeout=1800)
+    os.remove(dump_path)
+    if restore.returncode != 0:
+        _drop_tmp()
+        return f"scrub_database failed to restore the verification copy of '{database}':\n{restore.stderr}"
+
+    # 2. Scrub the real database in place.
+    result = _run(
+        [SCRUBDB_BIN, database, "--apply", "--i-confirm-this-is-a-copy", "--report", report_path],
+        timeout=7200,
+    )
+    output = (result.stdout + result.stderr).strip()
+    try:
+        with open(report_path) as f:
+            report = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        _drop_tmp()
+        return f"scrub_database failed to produce a report (exit {result.returncode}):\n{output}"
+
+    run = report.get("run", {})
+    summary = (
+        f"columns changed: {run.get('columns_changed', '?')}, "
+        f"rows updated: {run.get('rows_updated', '?')}"
+    )
+    if result.returncode != 0:
+        _drop_tmp()
+        return f"scrubdb exited {result.returncode} ({summary}):\n{output}"
+
+    # 3. Verify: diff the pre-scrub snapshot against the now-scrubbed real
+    #    database (same cluster, different names).
+    pg_host = os.environ.get("PGHOST", "")
+    pg_port = os.environ.get("PGPORT", "5432")
+    pg_user = os.environ.get("PGUSER", "")
+    diff_result = _run(
+        [
+            sys.executable, VERIFY_SCRUB_DIFF_SCRIPT,
+            "--db", tmp_db, "--dst-db", database,
+            "--report", report_path,
+            "--src-host", pg_host, "--src-port", pg_port, "--src-user", pg_user,
+            "--dst-host", pg_host, "--dst-port", pg_port, "--dst-user", pg_user,
+            "--diff-report", diff_report_path,
+        ],
+        timeout=1800,
+    )
+    cleaned_up = _drop_tmp()
+    cleanup_note = "" if cleaned_up else f" (also: failed to drop throwaway copy '{tmp_db}' — drop it manually)"
 
     try:
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=7200)
-    except subprocess.TimeoutExpired:
-        return "Error: obfuscation timed out after 2 hours."
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode != 0:
-        return f"Obfuscation failed (exit {result.returncode}):\n{output}"
-    return f"Obfuscation completed:\n{output}"
+        with open(diff_report_path) as f:
+            diff_report = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return (
+            f"scrubdb applied ({summary}) but the verification check itself failed "
+            f"to produce a report (exit {diff_result.returncode}):\n"
+            f"{(diff_result.stdout + diff_result.stderr).strip()}\n"
+            f"NOT marked as confirmed anonymized — other tools remain locked out "
+            f"of '{database}'.{cleanup_note}"
+        )
+
+    if not diff_report.get("clean"):
+        return (
+            f"scrubdb applied ({summary}) but verification found it not fully clean: "
+            f"{diff_report.get('value_findings_total', 0)} unchanged value(s), "
+            f"{len(diff_report.get('cardinality_findings', []))} row-count mismatch(es), "
+            f"{len(diff_report.get('unverifiable_tables', []))} unverifiable table(s). "
+            f"NOT marked as confirmed anonymized — other tools remain locked out of "
+            f"'{database}'. Review the diff report ({diff_report_path}) and scrubdb "
+            f"report ({report_path}), add --exclude/--ruleset overrides as needed, "
+            f"and re-run scrub_database.{cleanup_note}"
+        )
+
+    try:
+        conn = _db_connect(database, readonly=False)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ir_config_parameter (key, value) VALUES (%s, 'true') "
+                "ON CONFLICT (key) DO UPDATE SET value = 'true'",
+                (SCRUBDB_MARKER_KEY,),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return (
+            f"scrubdb applied and verified clean ({summary}) but marking the "
+            f"database as confirmed failed: {e}"
+        )
+
+    return (
+        f"'{database}' scrubbed and confirmed clean ({summary}). "
+        f"Verification found no surviving unmasked values. Other tools are now unlocked."
+        f"{cleanup_note}"
+    )
 
 
 @mcp.tool()
@@ -459,28 +591,34 @@ def start_odoo(database: str, extra_args: str = "") -> str:
         database: Target database name (e.g. 'odoo', 'adi')
         extra_args: Additional odoo-bin flags, e.g. '--dev=all'
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     proc = _state["odoo_process"]
     if proc and proc.poll() is None:
         return f"Odoo is already running (pid {proc.pid}). Call stop_odoo first."
 
+    extra_args_list = extra_args.split() if extra_args else []
+    log_path = next(
+        (a.split("=", 1)[1] for a in extra_args_list if a.startswith("--logfile=")),
+        LOG_FILE,
+    )
+    extra_args_list = [a for a in extra_args_list if not a.startswith("--logfile=")]
     cmd = [
         ODOO_BIN,
         f"--addons-path={ODOO_ADDONS}",
         "-d", database,
         "--workers=0",
-        f"--logfile={LOG_FILE}",
+        f"--logfile={log_path}",
     ]
-    if extra_args:
-        cmd.extend(extra_args.split())
+    cmd.extend(extra_args_list)
 
     try:
-        proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+        proc = subprocess.Popen(cmd, preexec_fn=os.setsid, env=_odoo_subprocess_env())
         _state["odoo_process"] = proc
+        _state["log_file"] = log_path
         return (
             f"Odoo server started (pid {proc.pid}). "
-            f"Logs -> {LOG_FILE}. Call get_odoo_logs to observe output."
+            f"Logs -> {log_path}. Call get_odoo_logs to observe output."
         )
     except Exception as e:
         return f"Error starting Odoo: {e}"
@@ -493,10 +631,11 @@ def get_odoo_logs(lines: int = 100) -> str:
     Args:
         lines: Number of lines to return from the end of the log (default 100)
     """
-    if not os.path.exists(LOG_FILE):
+    log_file = _state["log_file"]
+    if not os.path.exists(log_file):
         return "No log file found. Start the server first with start_odoo."
     try:
-        result = subprocess.run(["tail", f"-{lines}", LOG_FILE], capture_output=True, text=True)
+        result = subprocess.run(["tail", f"-{lines}", log_file], capture_output=True, text=True)
         return result.stdout or "(log file is empty)"
     except Exception as e:
         return f"Error reading logs: {e}"
@@ -513,7 +652,7 @@ def attach_debugger(database: str, extra_args: str = "") -> str:
         database: Target database name
         extra_args: Additional odoo-bin flags, e.g. '-u sale'
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     proc = _state["odoo_process"]
     if proc and proc.poll() is None:
@@ -532,7 +671,7 @@ def attach_debugger(database: str, extra_args: str = "") -> str:
         cmd.extend(extra_args.split())
 
     try:
-        _state["odoo_process"] = subprocess.Popen(cmd, preexec_fn=os.setsid)
+        _state["odoo_process"] = subprocess.Popen(cmd, preexec_fn=os.setsid, env=_odoo_subprocess_env())
         return (
             f"Odoo started under debugpy (pid {_state['odoo_process'].pid}), "
             f"listening on port {DEBUGPY_PORT}. Call connect_debugger to begin."
@@ -581,7 +720,7 @@ def search_records(
         limit: Maximum number of records to return (default 80)
         offset: Number of records to skip for pagination (default 0)
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     try:
         domain_parsed = json.loads(domain)
@@ -620,7 +759,7 @@ def get_model_fields(database: str, model: str, attributes: str = "[]") -> str:
         attributes: Field attributes to include as a JSON array
                     (e.g. '["string","type","required"]'). Pass '[]' for all.
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     try:
         attributes_parsed = json.loads(attributes)
@@ -666,7 +805,7 @@ def call_method(
         args: Positional arguments as a JSON array (e.g. '[[1, 2, 3]]' if the first argument is a list of IDs)
         kwargs: Keyword arguments as a JSON object (e.g. '{"context": {"lang": "en_US"}}')
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     
     try:
@@ -1043,14 +1182,13 @@ def explain_query(database: str, sql: str) -> str:
         database: Database name
         sql: A SELECT query (no DML allowed)
     """
-    if not _is_obfuscated(database):
+    if not _is_scrubbed(database):
         return _ACCESS_DENIED.format(database)
     sql_stripped = sql.strip().upper()
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         return "Error: only SELECT/WITH queries are allowed."
     try:
-        conn = psycopg2.connect(host=DB_HOST, user=DB_USER, dbname=database)
-        conn.set_session(readonly=True)
+        conn = _db_connect(database)
         with conn.cursor() as cur:
             cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}")
             rows = cur.fetchall()

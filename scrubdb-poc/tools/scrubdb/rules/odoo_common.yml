@@ -1,0 +1,87 @@
+# Created by Odoo — Technical Support tooling (scrubdb).
+#
+# Version-tolerant PII map for Odoo databases (Community & Enterprise, 12..19+).
+# Passed to blanket mode as --ruleset: each entry here *overrides* the
+# transform blanket mode would otherwise pick for that column — including its
+# own technical-table/filestore/unique-safety/PERSON_NAME_COLUMNS/RISKY_PATTERNS/
+# content-guard handling. It does NOT override the earlier structural
+# exclusions (primary key, foreign key, system/audit column, CHECK constraint,
+# Selection field, or res_users.login when --normalize-logins is on) — those
+# are never masked regardless of what a rule says, since doing so would break
+# the database. Rules that target a table or column absent from the database
+# being masked are reported as `skipped_rules` and cause no error, so one file
+# serves every version. This is a floor, not a ceiling: every column with no
+# rule here still gets blanket mode's own type-based/RISKY_PATTERNS/content-
+# guard masking automatically.
+
+rules:
+  res_partner:
+    name: fake_name
+    display_name: fake_name
+    email: fake_email
+    phone: fake_phone
+    mobile: fake_phone
+    street: fake_street
+    street2: fake_street
+    city: fake_city
+    zip: scramble_digits
+    vat: scramble_digits
+    comment: scrub_text
+    website: null
+
+  res_users:
+    login: fake_email
+    password: redact
+    password_crypt: redact
+
+  res_company:
+    name: fake_company
+    email: fake_email
+    phone: fake_phone
+    vat: scramble_digits
+
+  res_partner_bank:
+    acc_number: scramble_digits
+    sanitized_acc_number: scramble_digits
+    acc_holder_name: fake_name
+
+  hr_employee:
+    name: fake_name
+    work_email: fake_email
+    work_phone: fake_phone
+    mobile_phone: fake_phone
+    private_email: fake_email
+    private_phone: fake_phone
+    ssnid: scramble_digits
+    sinid: scramble_digits
+    identification_id: scramble_digits
+    passport_id: scramble_digits
+    birthday: null
+
+  crm_lead:
+    contact_name: fake_name
+    partner_name: fake_company
+    email_from: fake_email
+    phone: fake_phone
+    mobile: fake_phone
+    street: fake_street
+    city: fake_city
+    zip: scramble_digits
+
+  mail_message:
+    email_from: fake_email
+    body: scrub_text
+
+  ir_mail_server:
+    smtp_pass: redact
+
+  fetchmail_server:
+    password: redact
+
+  # ir_attachment binary payloads can embed whole PDFs of invoices/IDs.
+  ir_attachment:
+    datas: null
+    raw: null
+    store_fname: null
+    index_content: null
+    description: scrub_text
