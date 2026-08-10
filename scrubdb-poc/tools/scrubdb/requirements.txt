@@ -1,0 +1,9 @@
+# scrubdb runtime requirements — Created by Odoo (Technical Support tooling).
+# Install:  pip install -r requirements.txt
+#
+# The engine and the test suite import nothing third-party; these are only
+# needed to run against a real database.
+
+psycopg2-binary>=2.8   # connect to PostgreSQL (required for a real run)
+pyyaml                 # YAML rulesets (--ruleset); JSON works without it
+faker                  # nicer fake values; a built-in fallback is used if absent

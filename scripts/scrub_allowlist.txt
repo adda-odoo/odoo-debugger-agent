@@ -1,0 +1,17 @@
+# Columns that copy_and_scrub_db.sh should leave untouched (not scrubbed).
+#
+# Passed to scrubdb as --exclude-file: one glob per line, '#' comments allowed,
+# blank lines ignored. Each glob matches either a bare column name (across all
+# tables) or an exact "table.column" pair.
+#
+# Since verify_scrub_diff.py only requires columns scrubdb actually touched to
+# differ from main (see scripts/verify_scrub_diff.py), anything excluded here
+# is automatically exempt from that check too — no changes needed there.
+#
+# Examples:
+#
+# res_partner.phone           exact table.column — only res_partner.phone is kept
+# *.currency_id               bare column name — matches <anything>.currency_id
+# assessment_test.score       keep a specific non-PII business field as-is
+# x_sale_order.x_hosting      custom/studio field kept unscrubbed
+# *_code                      glob — keeps any column ending in _code (e.g. zip_code)

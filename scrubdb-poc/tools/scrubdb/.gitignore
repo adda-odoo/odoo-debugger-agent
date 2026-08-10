@@ -1,0 +1,14 @@
+# Created by Odoo — Technical Support tooling (scrubdb).
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# packaging build output
+build/
+dist/
+
+# runtime artifacts
+*.report.json
+plan.json
+report.json

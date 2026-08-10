@@ -1,0 +1,38 @@
+# Created by Odoo — Technical Support tooling (scrubdb).
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrubdb"
+description = "One-way, version-independent PostgreSQL anonymizer (run against a COPY)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary — Odoo internal tooling" }
+authors = [{ name = "Odoo — Technical Support" }]
+keywords = ["postgresql", "anonymization", "odoo", "pii", "gdpr"]
+version = "0.1.0"
+# psycopg2 is needed to connect to a database; the engine/tests run without it.
+dependencies = ["psycopg2-binary>=2.8"]
+
+[project.optional-dependencies]
+yaml = ["pyyaml"]          # only for YAML rulesets; JSON rulesets work without
+faker = ["faker"]          # optional; built-in fallback generators used if absent
+dev = ["pytest"]
+
+[project.scripts]
+scrubdb = "scrubdb.cli:run"
+
+[project.urls]
+"Brand assets" = "https://www.odoo.com/page/brand-assets"
+
+# Flat / Odoo-style layout: the package files live in THIS directory, so map the
+# `scrubdb` package to "." instead of restructuring into scrubdb/scrubdb/.
+[tool.setuptools]
+packages = ["scrubdb"]
+
+[tool.setuptools.package-dir]
+scrubdb = "."
+
+[tool.setuptools.package-data]
+scrubdb = ["rules/*.yml"]

@@ -5,7 +5,7 @@ description: Dedicated agent skill for debugging Odoo databases and code using t
 
 # Odoo Debugger
 
-This skill provides a structured workflow for debugging Odoo applications using the `odoo-debug` MCP server. It acts as an orchestrator, allowing you to fetch, obfuscate, run, and deeply inspect Odoo databases.
+This skill provides a structured workflow for debugging Odoo applications using the `odoo-debug` MCP server. It acts as an orchestrator, allowing you to fetch, scrub, run, and deeply inspect Odoo databases.
 
 ## 📚 Official Documentation
 Reference the official Odoo documentation for version-specific implementation details:
@@ -18,10 +18,10 @@ Whenever you debug an Odoo issue, you MUST apply systematic debugging discipline
 
 ## ⚠️ Security Prerequisites (CRITICAL)
 
-Before performing any debugging or querying against an Odoo database, you **MUST** ensure the database is obfuscated. The MCP tools strictly enforce this, but you should explicitly follow this flow:
+Before performing any debugging or querying against an Odoo database, you **MUST** ensure the database has been confirmed anonymized. The MCP tools strictly enforce this — they check for a marker that is only written after a structural clean/dirty diff confirms the scrub actually took — but you should explicitly follow this flow:
 
-1.  **Fetch the database** (if not already local) using `fetch_database`.
-2.  **Obfuscate the database** using `obfuscate_database`. The database name and Odoo version are required.
+1.  **Check whether it's already scrubbed.** A database is normally copied over from `main` and scrubbed on the host (`start.sh <db_name>`) before the container even starts, so most of the time nothing further is needed.
+2.  **If it isn't** (missing the marker), call `scrub_database` with just the database name — it scrubs it in place and only unlocks the other tools if the diff check comes back clean. If it doesn't, the tool reports why instead of unlocking — review and re-run.
 3.  **Ensure branch alignment** by calling `switch_odoo_branch` to match the target database version (verifiable via `get_odoo_version`).
 
 ## Core Workflows
