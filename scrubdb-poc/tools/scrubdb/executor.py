@@ -57,6 +57,21 @@ def _unique_suffix(old, ctx) -> str:
     return "_" + ctx.digest("uniq", old).hex()[:8]
 
 
+def _widen_unique_text_column(cur, src, col) -> None:
+    """Drop any length cap on a column about to get ``_unique_suffix`` appended.
+
+    This only runs on a disposable, already-anonymized copy, so there's no
+    reason to keep enforcing the original varchar(n)/char(n) cap once its
+    content is masked garbage anyway. Dropping it (an in-place, no-rewrite
+    catalog change — Postgres never has to touch existing rows to widen a
+    text-family column to ``text``) avoids a StringDataRightTruncation once
+    the masked value plus its 9-character suffix no longer fits (seen live on
+    Odoo's 21-char Mexican customs/pedimento number field, already at the
+    limit before masking).
+    """
+    cur.execute(f"ALTER TABLE {src} ALTER COLUMN {col} TYPE text")
+
+
 def _map_json_strings(obj, fn, ctx):
     """Apply ``fn`` to every string *leaf* of a decoded JSON value.
 
@@ -198,6 +213,11 @@ def _apply_column(cur, action: Action, ctx: Context, schema: str, batch_size: in
     cast = f"::{action.data_type}" if needs_cast else ""
     match_expr = f"t.{col}::text" if needs_cast else f"t.{col}"
 
+    if action.unique and is_text:
+        # A distinctness suffix (`_unique_suffix`, below) is about to be
+        # appended to every masked value in this column — drop first.
+        _widen_unique_text_column(cur, src, col)
+
     mapping = []
     for old in originals:
         if is_json:
@@ -213,16 +233,61 @@ def _apply_column(cur, action: Action, ctx: Context, schema: str, batch_size: in
     if not mapping:
         return (0, len(originals))
 
+    rows_updated = _run_update_with_retry(
+        cur, src, col, cast, match_expr, t_guard, mapping, batch_size, action, ctx, is_text
+    )
+    return (rows_updated, len(originals))
+
+
+def _run_update(cur, src, col, cast, match_expr, t_guard, mapping, batch_size) -> int:
     if len(mapping) <= batch_size:
         # Fits in one statement: a single UPDATE evaluates its SET/WHERE
         # against a consistent pre-statement snapshot, so this is inherently
         # chain-safe regardless of how the (old, new) pairs relate to each
         # other.
-        rows_updated = _update_via_values(cur, src, col, cast, match_expr, t_guard, mapping)
-    else:
-        rows_updated = _update_via_temp_table(cur, src, col, cast, match_expr, t_guard, mapping, batch_size)
+        return _update_via_values(cur, src, col, cast, match_expr, t_guard, mapping)
+    return _update_via_temp_table(cur, src, col, cast, match_expr, t_guard, mapping, batch_size)
 
-    return (rows_updated, len(originals))
+
+def _run_update_with_retry(cur, src, col, cast, match_expr, t_guard, mapping, batch_size,
+                            action: Action, ctx, is_text: bool) -> int:
+    """Run the UPDATE; on a UniqueViolation, retry once with a forced suffix.
+
+    Introspection (``introspect.fetch_unique_columns``) only sees real
+    UNIQUE/PK constraints — it deliberately can't see a partial or expression
+    unique index (e.g. Odoo's ``account_move_unique_name``, unique on
+    ``(name, journal_id)`` only for posted moves). A column behind one of
+    those never gets ``action.unique = True``, so its masked values are never
+    suffixed for distinctness and can collide with an adjacent, not-yet-masked
+    original in a dense sequence (an invoice "00154" masked into "00155"
+    colliding with an actual pre-existing "00155"). Rather than requiring
+    every such hidden constraint to be discovered and special-cased ahead of
+    time, retry once inside a SAVEPOINT using the same deterministic
+    per-value suffix already used for known-unique text columns (see
+    ``_unique_suffix``). If the column was already suffixed (or isn't text)
+    the violation is a genuine bug elsewhere, so it's re-raised immediately.
+    """
+    import psycopg2  # lazy: mirrors connect()'s own lazy import
+
+    cur.execute("SAVEPOINT scrubdb_col")
+    try:
+        rows = _run_update(cur, src, col, cast, match_expr, t_guard, mapping, batch_size)
+    except psycopg2.errors.UniqueViolation:
+        cur.execute("ROLLBACK TO SAVEPOINT scrubdb_col")
+        if action.unique or not is_text:
+            raise
+        _logger.warning(
+            "%s.%s: masked values collided with a constraint introspection "
+            "didn't see (likely a partial/expression unique index) — "
+            "retrying with a forced distinctness suffix",
+            action.table, action.column,
+        )
+        _widen_unique_text_column(cur, src, col)
+        suffixed = [(old, new if new is None else str(new) + _unique_suffix(old, ctx))
+                    for old, new in mapping]
+        rows = _run_update(cur, src, col, cast, match_expr, t_guard, suffixed, batch_size)
+    cur.execute("RELEASE SAVEPOINT scrubdb_col")
+    return rows
 
 
 def _update_via_values(cur, src, col, cast, match_expr, t_guard, mapping) -> int:

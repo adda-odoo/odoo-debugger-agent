@@ -5,7 +5,7 @@ description: Dedicated agent skill for debugging Odoo databases and code using t
 
 # Odoo Debugger
 
-This skill provides a structured workflow for debugging Odoo applications using the `odoo-debug` MCP server. It acts as an orchestrator, allowing you to fetch, scrub, run, and deeply inspect Odoo databases.
+This skill provides a structured workflow for debugging Odoo applications using the `odoo-debug` MCP server. It acts as an orchestrator, allowing you to fetch, scrub, run, and root-cause issues in Odoo databases through data inspection, logs, profiling, and reproduction in the web client — not through a live step-through debugger.
 
 ## 📚 Official Documentation
 Reference the official Odoo documentation for version-specific implementation details:
@@ -36,24 +36,24 @@ If you need to look at specific records without running the full Odoo applicatio
 *   `call_method`: Call methods on an Odoo model (e.g., `action_confirm`, `read`) using the JSON-2 API. You may use this to debug certain methods whose outputs or effects you are uncertain about.
  You can pass positional args and kwargs using JSON syntax. Requires the server to be running.
 
-### 2. Live Debugging (DAP)
-To trace Python execution, inspect variables, or catch exceptions as they happen:
-
-1.  Start Odoo in debug mode using `attach_debugger`.
-2.  Set breakpoints using `set_breakpoint`.
-3.  Connect the client using `connect_debugger` (this releases the startup hold).
-4.  Trigger the bug (e.g., via a cURL request, browser automation, or waiting for a cron job).
-5.  Once execution pauses, use `get_call_stack` to find your frame ID.
-6.  Inspect state using `get_variables` or `evaluate_expression`.
-7.  Resume with `resume_execution` or pause running threads with `pause_execution`.
-8.  Clean up using `stop_odoo`.
-
-### 3. Performance Profiling
+### 2. Performance Profiling
 If the issue is related to speed, memory leaks, or hangs, do not guess. Use the profiling tools:
 
 *   **CPU Profiling:** Use `profile_cpu` to generate a py-spy flamegraph. This is ideal for finding hot code paths.
 *   **Memory Profiling:** Use `memray_attach` to track allocations, followed by `memray_detach`, and finally `memray_flamegraph` to visualize the memory footprint.
 *   **Instant Diagnostics:** Use `get_process_info` for a quick glance at memory/threads, or `dump_stacks` to instantly see what all threads are currently doing (ideal for diagnosing deadlocks).
+
+### 3. Reproducing in the Web Client
+If the issue is visible in the UI — a view that renders wrong, a JavaScript or Owl error, an action that misbehaves, an asset bundle that won't build — drive the web client instead of inferring it from the data. See the `odoo-ui-repro` skill for the full workflow and the Odoo-specific traps; the tools are:
+
+*   `browser_open`: Launch headless Chromium against the running server and log in (reuses the ORM tools' session, so no login form). Requires `start_odoo`.
+*   `browser_snapshot`: An accessibility-tree view of what is on screen. This is the primary way to see the page — read it, then build selectors from the roles and names it shows.
+*   `browser_goto` / `browser_click` / `browser_fill` / `browser_press`: Navigate and interact. Each waits for Odoo to settle and reports the resulting breadcrumb plus any error dialog.
+*   `browser_console`: JavaScript exceptions, console output, renderer crashes.
+*   `browser_network`: Requests, with `/web/dataset/call_kw` decoded to model/method and the server traceback extracted. Odoo returns server-side exceptions as HTTP 200 with an error body, so read this rather than the status code.
+*   `browser_eval`: Run JavaScript in the page when nothing else reaches — Owl component state, services off `odoo.__WOWL_DEBUG__.root.env`.
+*   `browser_screenshot`: PNG to the artifacts directory. Use for visual bugs only; a snapshot says more per token.
+*   `browser_close`: Frees the Chromium process. Always call it.
 
 ### 4. General Server Execution
 If you just need the server running to test an API or reproduce an issue:
@@ -66,4 +66,4 @@ If you just need the server running to test an API or reproduce an issue:
 
 *   **Never assume the schema:** Odoo schemas change drastically between versions (e.g., `hr.contract` vs `hr.version` in v19). Always use `get_model_fields` or `query_psql` to check `information_schema` before writing large queries.
 *   **Logs are your friend:** If an ORM call fails, the answer is usually in `get_odoo_logs`.
-*   **Clean up:** Ensure `stop_odoo` and `memray_detach` are called before ending your session to prevent zombie processes.
+*   **Clean up:** Ensure `browser_close`, `stop_odoo` and `memray_detach` are called before ending your session to prevent zombie processes.

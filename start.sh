@@ -28,7 +28,7 @@ mkdir -p "$HOME/.odoo-debugger-claude"
 cd "$SCRIPT_DIR"
 
 # Optional: ./start.sh <db_name> — ensure that database is present and
-# scrubbed on the ai-dev cluster (the only Postgres the container can reach)
+# scrubbed on the aidev cluster (the only Postgres the container can reach)
 # before launching. If it's missing, copy it over from main and scrub it
 # here on the host, since the container itself can never reach main.
 DB_NAME="${1:-}"
@@ -41,18 +41,30 @@ if [ -n "$DB_NAME" ]; then
         "SELECT value FROM ir_config_parameter WHERE key = 'scrubdb.run_completed'" 2>/dev/null || true)
 
     if [ "$STATUS" = "true" ]; then
-        echo "Database '$DB_NAME' already scrubbed on ai-dev — skipping copy."
+        echo "Database '$DB_NAME' already scrubbed on aidev — skipping copy."
     elif [ -z "$STATUS" ] && psql -h "$AI_DEV_HOST" -p "$AI_DEV_PORT" -U "$AI_DEV_USER" -d postgres -tAc \
         "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1; then
-        echo "Error: '$DB_NAME' exists on ai-dev but isn't marked as scrubbed."
+        echo "Error: '$DB_NAME' exists on aidev but isn't marked as scrubbed."
         echo "Inspect/drop it manually before retrying (won't auto-overwrite)."
         exit 1
     else
-        echo "Database '$DB_NAME' not found on ai-dev — copying + scrubbing from main..."
+        echo "Database '$DB_NAME' not found on aidev — copying + scrubbing from main..."
         "$SCRIPT_DIR/scripts/copy_and_scrub_db.sh" "$DB_NAME"
     fi
     export DB_NAME
 fi
 
 echo "Starting Odoo Debugger Sandbox..."
-docker compose run --rm sandbox
+# Build the sandbox's `debugger` user with THIS user's ids, so edits it makes
+# to the bind-mounted repos under /source land as you on the host (and so it
+# can write them at all — see the Dockerfile's HOST_UID comment).
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+export HOST_UID HOST_GID
+# --build re-evaluates the image against the current Dockerfile/build context
+# every run; Docker's own layer cache makes this a no-op (a few hundred ms)
+# when nothing changed, but without it `docker compose run` silently keeps
+# using whatever image was last built, even after Dockerfile/mcp_servers
+# edits — that drift is exactly what let removed MCP tools (e.g.
+# connect_debugger) keep running in a stale container.
+docker compose run --build --rm sandbox

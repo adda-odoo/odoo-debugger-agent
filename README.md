@@ -6,15 +6,15 @@ This contains a fully self-contained Odoo debugging environment. It packages a s
 
 ### Features
 - **Isolated Environment:** The agent runs in a Docker container with restricted access to your Odoo workspace.
-- **Expert Subagent:** The `odoo-debugger` agent is pre-configured with Odoo-specific diagnostic workflows.
-- **Deep Inspection:** Built-in DAP (Debug Adapter Protocol) support for inspecting variables, call stacks, and evaluating expressions in a paused Odoo process. *(Note: DAP features are currently experimental, lack advanced stepping features, and may be buggy).*
+- **Expert Subagent:** The `odoo-debugger` agent is pre-configured with Odoo-specific diagnostic workflows, focused on root-cause analysis through data, logs, profiling, and browser reproduction rather than a live step-through debugger.
 - **Performance Tools:** Integrated `py-spy` for flamegraphs and `memray` for memory profiling.
+- **Browser Reproduction:** Headless Chromium (Playwright) driving the Odoo web client in-container, so view-layer bugs — Owl crashes, failed RPCs, broken asset bundles — can be reproduced and read directly instead of inferred from SQL.
 - **Database Utilities:** Tools for scrubbing PII and running SQL/ORM queries.
 
 ### Structure
 - `Dockerfile`: Builds the sandbox image with all dependencies.
 - `agents/`: Contains the `odoo-debugger` subagent definition.
-- `skills/`: Contains the `odoo-debugger` skill (best practices & documentation).
+- `skills/`: Contains the agent's skills — `odoo-debugger` (best practices & documentation) and `odoo-ui-repro` (reproducing bugs through the web client). Every directory here is deployed automatically.
 - `mcp_servers/`: Contains the `debug_server.py` MCP implementation.
 - `scrubdb-poc/tools/scrubdb/`: The scrubdb anonymizer — gates all database access (see its own README for details).
 
@@ -65,11 +65,13 @@ pipx install "./odoo-debugger-agent/scrubdb-poc/tools/scrubdb[yaml]"
 
 **DB connection settings:** the `ai-dev` connection details are fixed, not user-configurable: host `host.docker.internal`, port `5433`, role `odoo` / `odoo`. The isolation guarantee comes from the host's `ufw`/`pg_hba` scoping to that exact port, not from hiding any of these values.
 
-**Authentication:** no environment variable is required. On your **first** `./start.sh` run, Claude Code will prompt you to log in interactively (Claude Pro/Max subscription or Console). Your login is then persisted on the host and reused automatically on every subsequent run — you do **not** log in again each time. Persistence uses a **dedicated** config directory (`~/.odoo-debugger-claude` on the host, exposed inside the container via `CLAUDE_CONFIG_DIR`). This deliberately keeps the sandbox separate from your **real** `~/.claude` config, so the container's MCP registration never pollutes your host Claude setup. `start.sh` creates the directory if needed. The `odoo-debugger` subagent, its skill, and the `odoo-debug` MCP server are auto-installed (and auto-trusted, with the MCP tools pre-allowed) on every launch — no manual setup.
+**Authentication:** no environment variable is required. On your **first** `./start.sh` run, Claude Code will prompt you to log in interactively (Claude Pro/Max subscription or Console). Your login is then persisted on the host and reused automatically on every subsequent run — you do **not** log in again each time. Persistence uses a **dedicated** config directory (`~/.odoo-debugger-claude` on the host, exposed inside the container via `CLAUDE_CONFIG_DIR`). This deliberately keeps the sandbox separate from your **real** `~/.claude` config, so the container's MCP registration never pollutes your host Claude setup. `start.sh` creates the directory if needed. The `odoo-debugger` subagent, its skills, and the `odoo-debug` MCP server are auto-installed (and auto-trusted, with the MCP tools pre-allowed) on every launch — no manual setup.
 
 **Lifecycle:** `start.sh` uses `docker compose run --rm sandbox`, which tears down the one-off `sandbox` container on exit. Databases copied into `ai-dev` persist across runs on the host — drop them manually via `psql`/`dropdb` if you want to force a fresh copy+scrub next time.
 
 **Fields to leave unscrubbed:** `scripts/scrub_allowlist.txt` lists columns that `copy_and_scrub_db.sh` should leave untouched — passed straight to `scrubdb` as `--exclude-file` (one glob per line, `#` comments allowed, matches either a bare column name across all tables or an exact `table.column`). Since the structural clean/dirty check (`verify_scrub_diff.py`) only requires columns `scrubdb` actually touched to differ from `main`, anything listed here is automatically exempt from that check too — no changes needed there when you add an entry.
+
+**Custom scrub rules per database:** `copy_and_scrub_db.sh` always passes the shared `scrubdb-poc/tools/scrubdb/rules/odoo_common.yml` ruleset to `scrubdb` via `--ruleset`, overriding the transform it would otherwise pick for specific columns (see that file's own comments). If `scripts/scrub_rules/<db_name>.yml` exists, it's merged on top of the shared ruleset — table/column by table/column — before scrubbing `<db_name>`, so a database with its own custom fields or unusual constraints (e.g. a partial unique index the generic PK/FK/unique-constraint introspection can't see) can get a targeted fix without editing the shared file. See `scripts/scrub_rules/README.md` for the format. `copy_and_scrub_db.sh` only scrubs a database once on first copy, so `dropdb` it from `ai-dev` before retrying `start.sh <db_name>` after adding or changing rules.
 
 ## ▶️ Starting Up the Container
 
@@ -97,7 +99,7 @@ tool, which takes the database name as an argument).
 ### First-run checklist (verify it works)
 1. `./odoo-debugger-agent/start.sh` → complete the interactive login when prompted.
 2. If asked to trust the `/source` workspace folder, accept it once.
-3. Type `/agents` — you should see `odoo-debugger` listed; `/mcp` should show `odoo-debug` connected.
+3. Type `/agents` — you should see `odoo-debugger` listed; `/mcp` should show `odoo-debug` connected, with the `browser_*` tools among its tools.
 4. Exit, then run `./odoo-debugger-agent/start.sh` again — it should **not** ask you to log in again.
 5. Give it a task (e.g. *"use the odoo-debugger agent to inspect res_partner in db X"*) and confirm it calls the `mcp__odoo-debug__*` tools.
 
@@ -113,15 +115,16 @@ The agent is designed to act autonomously based on your symptoms or questions. Y
   - *"Investigate why the hr.contract workflow is stuck in 'draft' for employee John Doe."*
   - *"Look at database 'my_db' and tell me what fields are currently set on product.template ID 45."*
 
-- **Triggering Deep Debugging (DAP):**
-  - *"Attach to 'my_db' and set a breakpoint where the invoice gets confirmed. Run the server and wait for me to trigger it."*
-  - *(Once paused)* *"Inspect the local variables to see why the total is calculating as zero."*
-
 - **Diagnosing Performance Bottlenecks:**
   - *"The server is hanging when I confirm a large order. Please generate a CPU flamegraph for 30 seconds so we can see the hot paths."*
   - *"We have a memory leak. Attach memray, let it run for 60 seconds, and generate an HTML report."*
 
+- **Reproducing in the Browser:**
+  - *"Open SO1029 in the web client and tell me what happens when you click Confirm — I get a spinner that never resolves."*
+  - *"The Contacts kanban is blank for this database. Load it in the browser and show me the console and network errors."*
+
 ## ⚠️ Security Notes
 - **Cluster isolation:** The only PostgreSQL reachable from inside the container is the host's `ai-dev` cluster — enforced by `ufw` (allowing the Docker bridge subnet through on `ai-dev`'s port only) and `pg_hba.conf` (scoping password auth on that port to the same subnet). The container's `network_mode: bridge` pins it to that exact subnet. The host's main Postgres cluster has no matching firewall rule and stays unreachable from inside the container.
 - **Anonymization:** The agent is trained to prioritize database anonymization. Databases normally arrive on `ai-dev` already scrubbed by the host-side pipeline before the container starts; `scrub_database` is the in-container fallback for one that hasn't been. Every database-touching tool checks for a marker that's only written after a structural clean/dirty diff confirms every column scrubdb touched actually changed — a database that scrubdb applied to but didn't verify clean stays locked out.
-- **Network:** The sandbox has internet access to reach Odoo documentation.
+- **Network:** The sandbox has internet access to reach Odoo documentation. The headless browser inherits that access — `browser_goto` accepts absolute URLs and is not restricted to the local Odoo server, so a page rendering scrubbed customer data can make outbound requests. Chromium also runs with `--no-sandbox` (the container has no `CAP_SYS_ADMIN`), so its isolation is the container's, not Chromium's.
+- **Artifacts:** Flamegraphs, memray logs and browser screenshots are written to `/source/.debug-artifacts`, which is bind-mounted from the host directory above this repo — they survive the container exiting. Override with `DEBUG_ARTIFACTS_DIR`.
