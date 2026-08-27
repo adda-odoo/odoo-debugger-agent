@@ -7,14 +7,14 @@ echo "--- Odoo Debugger Environment Setup ---"
 export HOME=/home/debugger
 STAGING_DIR="/opt/odoo-debug"
 
-# The container starts as root because the host's bind-mounted volumes
-# (the CLAUDE_CONFIG_DIR mount, and ../:/source) are owned by whatever UID
-# the host user has, which generally does not match this image's fixed
-# `debugger` UID (1000) — Docker also auto-creates a missing bind-mount
-# source as root:root, which would otherwise leave it unwritable by
-# `debugger` forever. Chown just those two mount points, then drop to
-# `debugger` for everything else. The actual Claude Code session must never
-# run as root.
+# The container starts as root because Docker auto-creates a missing
+# bind-mount source as root:root, which would otherwise leave it unwritable
+# by `debugger` forever. (The image builds `debugger` with the host user's
+# own UID/GID — see the Dockerfile's HOST_UID arg — so the repos under
+# /source are already writable; these chowns cover the config/.claude mount
+# points, which may not exist on the host yet.) Chown just those two, then
+# drop to `debugger` for everything else. The actual Claude Code session
+# must never run as root.
 if [ "$(id -u)" = "0" ]; then
     CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude-config}"
     mkdir -p "$CONFIG_DIR"
@@ -25,8 +25,8 @@ if [ "$(id -u)" = "0" ]; then
     # odoo-bin's own shebang (`#!/usr/bin/env python3`) resolves to this
     # image's system python3, which starts out with only the MCP server's
     # own deps installed, not Odoo's (werkzeug, babel, lxml, gevent, ...) —
-    # start_odoo/attach_debugger crash immediately, before Odoo's own
-    # logging even initializes, without this. debian/control (Odoo's own
+    # start_odoo crashes immediately, before Odoo's own logging even
+    # initializes, without this. debian/control (Odoo's own
     # dependency manifest, read by setup/debinstall.sh below) only exists
     # once /source is mounted at container start, not at image build time,
     # so this can't be baked into the Dockerfile — it has to run here, every
@@ -81,14 +81,19 @@ deploy_claude() {
     fi
 
     # 2. Deploy Skills (idempotent overwrite so they are always current).
+    #    Every directory staged under skills/ is deployed, so adding a skill to
+    #    the repo needs no change here or in the Dockerfile.
     echo "Deploying Odoo debugger skills..."
-    if [ -d "$STAGING_DIR/skills/odoo-debugger" ]; then
-        if mkdir -p "$CLAUDE_SKILLS_DIR" && cp -r "$STAGING_DIR/skills/odoo-debugger" "$CLAUDE_SKILLS_DIR/"; then
-            echo "  [OK] Skills deployed to $CLAUDE_SKILLS_DIR"
+    mkdir -p "$CLAUDE_SKILLS_DIR"
+    for skill_dir in "$STAGING_DIR"/skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill_name="$(basename "$skill_dir")"
+        if cp -r "$skill_dir" "$CLAUDE_SKILLS_DIR/"; then
+            echo "  [OK] Skill '$skill_name' deployed to $CLAUDE_SKILLS_DIR"
         else
-            echo "  [WARN] Failed to deploy skills to $CLAUDE_SKILLS_DIR (check mount permissions)"
+            echo "  [WARN] Failed to deploy skill '$skill_name' (check mount permissions)"
         fi
-    fi
+    done
 
     # 3. Pre-allow the odoo-debug MCP tools in workspace settings so the subagent
     #    doesn't prompt on every tool call. Merge-safe: preserve any existing

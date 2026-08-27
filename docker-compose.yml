@@ -1,10 +1,18 @@
 services:
   sandbox:
-    build: .
+    build:
+      context: .
+      args:
+        # Build the container's `debugger` user with the host user's real
+        # ids so it can write the bind-mounted repos under /source (they keep
+        # host ownership, so a mismatched UID is read-only). start.sh exports
+        # these; the defaults only apply if compose is invoked directly.
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
     image: odoo-debugger-sandbox:latest
     # Attach to Docker's default bridge network (not a project-specific one)
     # so the container lands on the exact subnet (172.17.0.0/16) that the
-    # host's ai-dev Postgres cluster is firewalled to accept.
+    # host's aidev Postgres cluster is firewalled to accept.
     network_mode: bridge
     environment:
       # Use a DEDICATED Claude config dir so we persist this sandbox's login without
@@ -13,12 +21,39 @@ services:
       - DB_NAME=${DB_NAME:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # py-spy (profile_cpu, dump_stacks) and memray attach to the running
+    # odoo-bin via ptrace. That process is a *sibling* of theirs — both are
+    # children of the MCP server — and the host runs Yama ptrace_scope=1,
+    # which only permits tracing a direct descendant. Docker also drops
+    # CAP_SYS_PTRACE by default. Granting it back satisfies both: the
+    # capability bypasses the Yama ancestry check. Without this every
+    # profiling tool fails with "Permission Denied".
+    cap_add:
+      - SYS_PTRACE
+    # Chromium (the browser_* tools) puts its renderer's shared-memory backing
+    # store in /dev/shm, which Docker sizes at 64MB by default — an Odoo list
+    # view of a few hundred rows overruns it and the tab dies with an opaque
+    # "Target page, context or browser has been closed". The tools also pass
+    # --disable-dev-shm-usage, so this is the second of two defences.
+    shm_size: "1gb"
     volumes:
       # Persist the sandbox's Claude login + config across runs (single directory mount).
       - ~/.odoo-debugger-claude:/home/debugger/.claude-config
       - ../:/source
       # Ignore the internal subfolder by mounting an anonymous volume over it
       - /source/internal
+      # entrypoint.sh runs Odoo's own debinstall.sh (apt-get update + install)
+      # on every launch, since debian/control only exists once /source is
+      # mounted (see entrypoint.sh's comment) -- these two volumes let apt
+      # reuse its package index and downloaded .debs across the container's
+      # otherwise-ephemeral (--rm) filesystem instead of refetching ~49MB of
+      # indexes plus every package fresh every single time.
+      - apt-lists:/var/lib/apt/lists
+      - apt-cache:/var/cache/apt/archives
     stdin_open: true
     tty: true
     command: ["claude"]
+
+volumes:
+  apt-lists:
+  apt-cache:

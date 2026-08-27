@@ -162,6 +162,71 @@ def fetch_transient_tables(cur, schema: str = "public") -> set[str]:
     return {row[0].replace(".", "_") for row in cur.fetchall()}
 
 
+def fetch_transient_relation_tables(cur, transient_tables: set[str], schema: str = "public") -> set[str]:
+    """Odoo many2many relation tables a CASCADE FK empties along with a wizard.
+
+    A many2many relation table has no ``ir_model`` entry of its own (a pure
+    link table, unlike ``fetch_transient_tables``'s targets) and isn't itself
+    a TransientModel — so nothing would otherwise tell the executor to expect
+    it empty. But Odoo's own ``_auto_init`` gives every such table exactly two
+    NOT NULL foreign-key columns and nothing else, both ``ON DELETE CASCADE``.
+    Deleting every row of a TransientModel wizard on one side of that FK
+    therefore cascades and empties this table completely too — the same
+    end state as if it had been truncated directly (confirmed live: 8 wizard
+    relation tables, e.g. ``account_move_validate_account_move_rel``, went to
+    0 rows once their wizard side was cleared, and
+    ``verify_scrub_diff.py``'s cardinality check flagged the "unexpected" row
+    loss since nothing had told it to expect it). Folding these into the same
+    set the caller unions into ``transient_tables`` lets the executor
+    truncate them explicitly (a no-op given the cascade already emptied them)
+    and the diff check accept the result as expected rather than a regression.
+    """
+    cur.execute(
+        """
+        SELECT c.table_name, c.column_name, c.is_nullable
+        FROM information_schema.columns c
+        JOIN information_schema.tables t
+          ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+        WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE'
+        """,
+        (schema,),
+    )
+    columns_by_table: dict[str, list[tuple[str, bool]]] = {}
+    for table, col, nullable in cur.fetchall():
+        columns_by_table.setdefault(table, []).append((col, nullable == "YES"))
+
+    cur.execute(
+        """
+        SELECT tc.table_name, kcu.column_name, ccu.table_name, rc.delete_rule
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+          ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+        JOIN information_schema.referential_constraints rc
+          ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s
+        """,
+        (schema,),
+    )
+    fks_by_table: dict[str, list[tuple[str, str, str]]] = {}
+    for table, col, ref_table, delete_rule in cur.fetchall():
+        fks_by_table.setdefault(table, []).append((col, ref_table, delete_rule))
+
+    result: set[str] = set()
+    for table, cols in columns_by_table.items():
+        if len(cols) != 2 or not all(is_nullable is False for _, is_nullable in cols):
+            continue
+        fks = fks_by_table.get(table, [])
+        if len(fks) != 2 or {c for c, _, _ in fks} != {c for c, _ in cols}:
+            continue
+        if any(rule != "CASCADE" for _, _, rule in fks):
+            continue
+        if any(ref_table in transient_tables for _, ref_table, _ in fks):
+            result.add(table)
+    return result
+
+
 def fetch_selection_columns(cur, schema: str = "public") -> set[tuple[str, str]]:
     """Return ``(table, column)`` for every Odoo Selection field.
 

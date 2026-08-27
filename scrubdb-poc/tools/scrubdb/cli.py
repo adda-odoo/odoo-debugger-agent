@@ -220,6 +220,7 @@ def run(argv=None) -> int:
         ck = introspect.fetch_check_constraint_columns(cur, args.schema)
         sel = introspect.fetch_selection_columns(cur, args.schema)
         transient = introspect.fetch_transient_tables(cur, args.schema)
+        transient |= introspect.fetch_transient_relation_tables(cur, transient, args.schema)
         _logger.info("building blanket plan%s…",
                      "" if args.no_content_scan else " (sampling text columns)")
         plan = build_blanket_plan(

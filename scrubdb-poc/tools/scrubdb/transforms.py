@@ -402,9 +402,21 @@ def _nudge(result, ctx):
             if ch.isalpha():
                 flipped = ch.upper() if ch.islower() else ch.lower()
                 return result[:i] + flipped + result[i + 1:]
-        return result + "_"  # no cased character to flip (digits/punct/empty)
+        if not result:
+            return "_"  # empty string: nothing to mutate in place, must grow
+        # No letter anywhere (digits/punctuation only, e.g. a fixed-width
+        # customs/reference number) — flip the last character IN PLACE rather
+        # than appending. Appending would grow the string by one, which can
+        # overflow a varchar(n) column already at its max length (seen live
+        # on a 21-char customs number field where mask_text happened to
+        # round-trip to itself).
+        last = result[-1]
+        bumped = str((int(last) + 1) % 10) if last.isdigit() else ("_" if last != "_" else "-")
+        return result[:-1] + bumped
     if isinstance(result, bytes):
-        return result + b"\x00"
+        if not result:
+            return b"\x00"
+        return result[:-1] + bytes([(result[-1] + 1) % 256])
     return result  # unknown type: leave as-is rather than guess wrong
 
 

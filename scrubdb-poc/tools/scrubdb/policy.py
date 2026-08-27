@@ -125,6 +125,15 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "currency", "model", "res_model", "*_model", "sequence", "color",
     "res_id",  # Odoo polymorphic record reference (with res_model) — not a real FK
     "tz", "*_tz",  # IANA timezone (res_users.tz, event.date_tz): masking → invalid tz
+    # Odoo's _parent_store materialized path ("1/4/17/") — the index behind
+    # every child_of/parent_of domain. It holds no PII (only ids the scrub
+    # keeps anyway), it carries no FK constraint to protect it, and nothing
+    # else here matches the name, so without this it is masked as ordinary
+    # text and every hierarchy query in the database silently returns wrong
+    # results — on stock_location, product_category, res_partner,
+    # account_analytic_account, hr_department and any other _parent_store
+    # model. (ir_ui_menu is spared only because ir_* tables are kept.)
+    "parent_path",
 ]
 
 # Odoo filestore/attachment payload columns, nulled by default in blanket mode.

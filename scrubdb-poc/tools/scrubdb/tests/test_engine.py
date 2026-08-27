@@ -42,11 +42,17 @@ class MockCursor:
         self.selects = []
         self.deletes = []
         self.inserts = []
+        self.alters = []
+        self.ordered_calls = []   # [(kind, sql), ...] in execution order
         self.rowcount = 0
 
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
-        if "information_schema.columns" in s:
+        self.ordered_calls.append((s.split(" ", 1)[0] if s else "", s))
+        if s.startswith("ALTER"):
+            self.alters.append(s)
+            self._result = []
+        elif "information_schema.columns" in s:
             self._result = list(self._columns)
         elif s.startswith("SELECT DISTINCT"):
             self.selects.append(s)
@@ -248,6 +254,34 @@ def test_resolve_ensures_changed_noise_number_small_integers():
         ctx = Context(key.to_bytes(4, "big"))
         for n in range(0, 5):
             assert fn(n, ctx) != n, f"noise_number({n}) was a no-op with key {key}"
+
+
+def test_nudge_string_no_letters_preserves_length():
+    # A digit/punctuation-only string (e.g. a fixed-width customs/reference
+    # number) has no letter to case-flip; nudging it must mutate a character
+    # in place rather than appending, or a value already at a varchar(n)
+    # column's max length overflows it (seen live on a 21-char customs
+    # number field where mask_text round-tripped to its own input).
+    ctx = Context(b"k")
+    for value in ("26  07  3435  6010065", "12345", "---", "0"):
+        nudged = transforms._nudge(value, ctx)
+        assert nudged != value
+        assert len(nudged) == len(value)
+
+
+def test_nudge_empty_string_and_bytes():
+    # Nothing to mutate in place, so growing by one is the only option —
+    # harmless since an empty value can't already be at a non-zero max length.
+    ctx = Context(b"k")
+    assert transforms._nudge("", ctx) == "_"
+    assert transforms._nudge(b"", ctx) == b"\x00"
+
+
+def test_nudge_bytes_preserves_length():
+    ctx = Context(b"k")
+    nudged = transforms._nudge(b"\xff\xff", ctx)
+    assert nudged != b"\xff\xff"
+    assert len(nudged) == 2
 
 
 # --- introspect ------------------------------------------------------------
@@ -560,6 +594,78 @@ def test_apply_plan_unique_appends_distinct_suffix():
     news = params[1::2]
     assert all(re.search(r"_[0-9a-f]{8}$", n) for n in news)  # deterministic suffix
     assert len(set(news)) == len(news)                        # stays distinct
+
+
+def test_apply_plan_unique_text_column_widened_before_suffixing():
+    # _unique_suffix appends 9 characters; a fixed-width varchar(n) column
+    # already at its max length (e.g. Odoo's 21-char customs/pedimento
+    # number) would overflow unless the cap is dropped first.
+    cols = [introspect.Column("stock_landed_cost", "l10n_mx_edi_customs_number",
+                              "character varying", True)]
+    plan = policy.build_blanket_plan(cols, unique_columns={
+        ("stock_landed_cost", "l10n_mx_edi_customs_number")})
+    cur = MockCursor(distinct=["26  07  3435  6010065", "26  07  3435  6010178"])
+    apply_plan(MockConn(cur), plan, dry_run=False)
+    assert any("l10n_mx_edi_customs_number" in a and "TYPE text" in a for a in cur.alters)
+    kinds = [kind for kind, _ in cur.ordered_calls]
+    assert kinds.index("ALTER") < kinds.index("UPDATE")   # widened before the write that needs it
+
+
+def test_apply_plan_retries_once_on_unique_violation_then_succeeds():
+    # A hidden constraint introspection can't see (a partial/expression unique
+    # index, e.g. Odoo's account_move_unique_name) never sets action.unique,
+    # so masked values can collide with an adjacent, not-yet-masked original
+    # in a dense sequence. The executor should retry once with the same
+    # distinctness suffix used for known-unique columns instead of aborting
+    # the whole run.
+    import psycopg2
+
+    class _RaiseOnceCursor(MockCursor):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.update_attempts = 0
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            if s.startswith("UPDATE"):
+                self.update_attempts += 1
+                if self.update_attempts == 1:
+                    raise psycopg2.errors.UniqueViolation("duplicate key value")
+            super().execute(sql, params)
+
+    cols = [introspect.Column("account_move", "name", "character varying", False)]
+    plan = policy.build_blanket_plan(cols)   # no unique_columns passed in
+    assert plan.actions[0].unique is False   # exactly the blind spot being simulated
+    cur = _RaiseOnceCursor(distinct=["00154", "00155"])
+    apply_plan(MockConn(cur), plan, dry_run=False)
+    assert cur.update_attempts == 2          # first attempt failed, retry succeeded
+    _, params = cur.updates[-1]
+    news = params[1::2]
+    assert len(set(news)) == len(news)       # retry's suffix kept them distinct
+
+
+def test_apply_plan_reraises_unique_violation_when_already_suffixed():
+    # If the column was already known-unique (already suffixed) and still
+    # collides, that's a genuine bug elsewhere — retrying blindly would just
+    # loop, so the executor must re-raise instead.
+    import psycopg2
+
+    class _AlwaysRaiseCursor(MockCursor):
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            if s.startswith("UPDATE"):
+                raise psycopg2.errors.UniqueViolation("duplicate key value")
+            super().execute(sql, params)
+
+    cols = [introspect.Column("shop", "slug", "character varying", False)]
+    plan = policy.build_blanket_plan(cols, unique_columns={("shop", "slug")})
+    assert plan.actions[0].unique is True
+    cur = _AlwaysRaiseCursor(distinct=["alice", "bob"])
+    try:
+        apply_plan(MockConn(cur), plan, dry_run=False)
+        assert False, "expected UniqueViolation to propagate"
+    except psycopg2.errors.UniqueViolation:
+        pass
 
 
 def test_apply_plan_date_column_text_roundtrip_and_cast():
@@ -934,6 +1040,20 @@ def test_blanket_masks_single_unique_text_with_suffix():
     assert plan.actions[0].unique is True
 
 
+def test_blanket_excludes_parent_path_by_default():
+    # _parent_store materialized path: masking it breaks every child_of /
+    # parent_of domain, and no PK/FK/type rule would otherwise protect it.
+    cols = _cols(("stock_location", "parent_path", "character varying"),
+                 ("product_category", "parent_path", "character varying"),
+                 ("hr_department", "parent_path", "character varying"))
+    plan = policy.build_blanket_plan(cols)
+    assert not plan.actions
+    kept = " ".join(plan.excluded)
+    assert "stock_location.parent_path [excluded]" in kept
+    assert "product_category.parent_path [excluded]" in kept
+    assert "hr_department.parent_path [excluded]" in kept
+
+
 def test_blanket_excludes_res_id_by_default():
     cols = _cols(("mail_message", "res_id", "integer"))
     plan = policy.build_blanket_plan(cols)      # no unique info; name pattern catches it
@@ -1021,6 +1141,58 @@ def test_fetch_transient_tables_non_odoo_returns_empty():
         def execute(s, sql, params=None): s._sql = sql
         def fetchall(s): return []          # ir_model not present
     assert introspect.fetch_transient_tables(Cur()) == set()
+
+
+def test_fetch_transient_relation_tables_finds_pure_m2m_cascade():
+    # account_move_validate_account_move_rel: a pure Odoo m2m relation table
+    # (two NOT NULL FK columns, nothing else) linking account_move to the
+    # validate_account_move wizard. Clearing the wizard table cascades and
+    # empties this table too, even though it's not a TransientModel itself.
+    columns_rows = [
+        ("account_move_validate_account_move_rel", "account_move_id", "NO"),
+        ("account_move_validate_account_move_rel", "validate_account_move_id", "NO"),
+        # a real, unrelated 3-column table must never be mistaken for one
+        ("res_partner", "id", "NO"),
+        ("res_partner", "name", "YES"),
+        ("res_partner", "email", "YES"),
+    ]
+    fk_rows = [
+        ("account_move_validate_account_move_rel", "account_move_id", "account_move", "CASCADE"),
+        ("account_move_validate_account_move_rel", "validate_account_move_id",
+         "validate_account_move", "CASCADE"),
+    ]
+
+    class Cur:
+        def execute(s, sql, params=None): s._sql = sql
+        def fetchall(s):
+            return columns_rows if "information_schema.columns" in s._sql else fk_rows
+
+    result = introspect.fetch_transient_relation_tables(Cur(), {"validate_account_move"})
+    assert result == {"account_move_validate_account_move_rel"}
+
+
+def test_fetch_transient_relation_tables_ignores_non_cascading_or_unrelated():
+    columns_rows = [
+        ("some_rel_table", "a_id", "NO"),
+        ("some_rel_table", "b_id", "NO"),
+    ]
+
+    class Cur:
+        def __init__(s, fk_rows): s._fk_rows = fk_rows
+        def execute(s, sql, params=None): s._sql = sql
+        def fetchall(s):
+            return columns_rows if "information_schema.columns" in s._sql else s._fk_rows
+
+    # NOT NULL + CASCADE but neither side is actually a transient table.
+    not_transient = Cur([("some_rel_table", "a_id", "table_a", "CASCADE"),
+                         ("some_rel_table", "b_id", "table_b", "CASCADE")])
+    assert introspect.fetch_transient_relation_tables(not_transient, {"some_wizard"}) == set()
+
+    # Transient on one side, but RESTRICT instead of CASCADE — clearing the
+    # wizard would fail outright, not silently cascade, so nothing to fold in.
+    not_cascade = Cur([("some_rel_table", "a_id", "some_wizard", "RESTRICT"),
+                       ("some_rel_table", "b_id", "table_b", "CASCADE")])
+    assert introspect.fetch_transient_relation_tables(not_cascade, {"some_wizard"}) == set()
 
 
 def test_blanket_truncates_transient_tables():

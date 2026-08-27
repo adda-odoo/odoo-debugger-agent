@@ -15,3 +15,8 @@
 # assessment_test.score       keep a specific non-PII business field as-is
 # x_sale_order.x_hosting      custom/studio field kept unscrubbed
 # *_code                      glob — keeps any column ending in _code (e.g. zip_code)
+
+account*
+account_move.*
+account_move_line.*
+account_analytic*

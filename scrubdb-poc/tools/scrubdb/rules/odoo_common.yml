@@ -85,3 +85,6 @@ rules:
     store_fname: null
     index_content: null
     description: scrub_text
+
+  account_move:
+    name: scrub_text

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Structural clean/dirty gate for scrubdb — used by copy_and_scrub_db.sh
-(cross-cluster, main -> ai-dev, same database name) and by debug_server.py's
+(cross-cluster, main -> aidev, same database name) and by debug_server.py's
 scrub_database (same cluster, a throwaway pre-scrub copy -> the real database,
 different names — see --dst-db).
 
-Replaces scrubdb's own removed --verify (a regex-based PII pattern scan, which
-false-positives heavily on scrubdb's own shape-preserving masked output).
-Instead, compares the pre-scrub copy against the post-scrub copy directly:
+Compares the pre-scrub copy against the post-scrub copy directly:
 table row counts must match (except tables scrubdb truncates), and every
 column scrubdb actually touched must differ row-for-row from the original
 wherever the original wasn't NULL.
@@ -40,7 +38,7 @@ same way, so this isn't a new exposure class. Per-run verification ignores it
 rather than flagging it.
 
 Sixth: a masked table with no single-column primary key can't be row-aligned
-between main and ai-dev at all, so it's recorded as "unverifiable" — normally
+between main and aidev at all, so it's recorded as "unverifiable" — normally
 treated as fail-closed (can't confirm clean, so don't trust it). But a table
 with no corresponding entry in ir_model (mapped the same way scrubdb's own
 introspect.py does, model.replace(".", "_")) isn't part of Odoo's actual data
