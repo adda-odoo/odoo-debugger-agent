@@ -5,6 +5,18 @@ Deliberately avoids ``pg_catalog`` and any version branching so it behaves the
 same on every PostgreSQL version. Enumerates *every* column, including custom
 development fields and columns orphaned by version upgrades — deciding which of
 them hold PII is classify.py's job, not this module's.
+
+Every ``information_schema`` view is read with its own single-view query and
+the rows are joined here in Python. Writing those joins in SQL is tidier but
+unusably slow: the views are nested subqueries the planner cannot see through,
+so it estimates them at a few rows and picks nested loops that re-execute
+``constraint_column_usage`` / ``referential_constraints`` once per constraint.
+On a 1131-table Odoo database each view reads in under 0.2s on its own, while
+the four-view join behind ``fetch_transient_relation_tables`` took 46s and the
+two-view join behind ``fetch_columns`` took 9s — together most of the minute
+the CLI appeared to hang on "introspecting keys/constraints". ``AS
+MATERIALIZED`` fixes it just as well, but needs PostgreSQL 12+, which is
+exactly the version branching this module exists to avoid.
 """
 from __future__ import annotations
 
@@ -37,26 +49,32 @@ class Column:
         return self.data_type in TEXTUAL_TYPES
 
 
-def fetch_columns(cur, schema: str = "public") -> list[Column]:
-    # Restrict to BASE TABLE: information_schema.columns also lists VIEW columns
-    # (Odoo has SQL views such as hr_employee_public, sale_report, ...), and
-    # those are not updatable — masking must only touch real tables.
+def _fetch_base_table_columns(cur, schema: str) -> list[tuple[str, str, str, str]]:
+    """``(table, column, data_type, is_nullable)`` for BASE TABLE columns only.
+
+    Restricted to BASE TABLE because ``information_schema.columns`` also lists
+    VIEW columns (Odoo has SQL views such as hr_employee_public, sale_report,
+    ...), and those are not updatable — masking must only touch real tables.
+    The restriction is applied in Python against ``fetch_tables``; see the
+    module docstring for why it isn't a SQL join.
+    """
+    base_tables = set(fetch_tables(cur, schema))
     cur.execute(
         """
-        SELECT c.table_name, c.column_name, c.data_type, c.is_nullable
-        FROM information_schema.columns c
-        JOIN information_schema.tables t
-          ON t.table_schema = c.table_schema
-         AND t.table_name = c.table_name
-        WHERE c.table_schema = %s
-          AND t.table_type = 'BASE TABLE'
-        ORDER BY c.table_name, c.ordinal_position
+        SELECT table_name, column_name, data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = %s
+        ORDER BY table_name, ordinal_position
         """,
         (schema,),
     )
+    return [row for row in cur.fetchall() if row[0] in base_tables]
+
+
+def fetch_columns(cur, schema: str = "public") -> list[Column]:
     return [
         Column(table=t, name=c, data_type=d, is_nullable=(n == "YES"))
-        for (t, c, d, n) in cur.fetchall()
+        for (t, c, d, n) in _fetch_base_table_columns(cur, schema)
     ]
 
 
@@ -73,6 +91,79 @@ def fetch_tables(cur, schema: str = "public") -> list[str]:
     return [r[0] for r in cur.fetchall()]
 
 
+def _fetch_fk_rows(cur, schema: str, with_delete_rule: bool = False):
+    """Foreign keys as ``(table, column, ref_table, ref_column[, delete_rule])``.
+
+    Reads ``table_constraints``, ``key_column_usage``, ``constraint_column_usage``
+    and (when asked) ``referential_constraints`` one view at a time and combines
+    them here — see the module docstring for why the SQL join is the slow way.
+
+    Rows are matched on ``constraint_name`` alone, within the schema, which is
+    what the SQL join did. Constraint names are not unique per schema in
+    PostgreSQL (this Odoo database has 4 collisions), so a name shared by two
+    constraints yields the same cross product it always has; keeping that
+    faithful matters more here than tightening it, since the masking plan is
+    built from the result.
+    """
+    cur.execute(
+        """
+        SELECT constraint_name, table_name
+        FROM information_schema.table_constraints
+        WHERE table_schema = %s AND constraint_type = 'FOREIGN KEY'
+        """,
+        (schema,),
+    )
+    fk_constraints = cur.fetchall()
+
+    cur.execute(
+        """
+        SELECT constraint_name, column_name
+        FROM information_schema.key_column_usage
+        WHERE table_schema = %s
+        """,
+        (schema,),
+    )
+    key_columns: dict[str, list[str]] = {}
+    for cname, col in cur.fetchall():
+        key_columns.setdefault(cname, []).append(col)
+
+    cur.execute(
+        """
+        SELECT constraint_name, table_name, column_name
+        FROM information_schema.constraint_column_usage
+        WHERE table_schema = %s
+        """,
+        (schema,),
+    )
+    referenced: dict[str, list[tuple[str, str]]] = {}
+    for cname, ref_table, ref_col in cur.fetchall():
+        referenced.setdefault(cname, []).append((ref_table, ref_col))
+
+    delete_rules: dict[str, list[str]] = {}
+    if with_delete_rule:
+        cur.execute(
+            """
+            SELECT constraint_name, delete_rule
+            FROM information_schema.referential_constraints
+            WHERE constraint_schema = %s
+            """,
+            (schema,),
+        )
+        for cname, rule in cur.fetchall():
+            delete_rules.setdefault(cname, []).append(rule)
+
+    rows = []
+    for cname, table in fk_constraints:
+        for col in key_columns.get(cname, ()):
+            for ref_table, ref_col in referenced.get(cname, ()):
+                if not with_delete_rule:
+                    rows.append((table, col, ref_table, ref_col))
+                    continue
+                for rule in delete_rules.get(cname, ()):
+                    rows.append((table, col, ref_table, ref_col, rule))
+    return rows
+
+
 def fetch_foreign_key_columns(cur, schema: str = "public") -> set[tuple[str, str]]:
     """Return every ``(table, column)`` involved in a foreign key.
 
@@ -80,24 +171,8 @@ def fetch_foreign_key_columns(cur, schema: str = "public") -> set[tuple[str, str
     blanket masking can keep both sides untouched and referential integrity
     survives. Version-independent (``information_schema`` only).
     """
-    cur.execute(
-        """
-        SELECT tc.table_name, kcu.column_name,
-               ccu.table_name AS ref_table, ccu.column_name AS ref_column
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-         AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage ccu
-          ON tc.constraint_name = ccu.constraint_name
-         AND tc.table_schema = ccu.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-          AND tc.table_schema = %s
-        """,
-        (schema,),
-    )
     cols: set[tuple[str, str]] = set()
-    for table, col, ref_table, ref_col in cur.fetchall():
+    for table, col, ref_table, ref_col in _fetch_fk_rows(cur, schema):
         cols.add((table, col))
         cols.add((ref_table, ref_col))
     return cols
@@ -181,36 +256,14 @@ def fetch_transient_relation_tables(cur, transient_tables: set[str], schema: str
     truncate them explicitly (a no-op given the cascade already emptied them)
     and the diff check accept the result as expected rather than a regression.
     """
-    cur.execute(
-        """
-        SELECT c.table_name, c.column_name, c.is_nullable
-        FROM information_schema.columns c
-        JOIN information_schema.tables t
-          ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-        WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE'
-        """,
-        (schema,),
-    )
     columns_by_table: dict[str, list[tuple[str, bool]]] = {}
-    for table, col, nullable in cur.fetchall():
+    for table, col, _data_type, nullable in _fetch_base_table_columns(cur, schema):
         columns_by_table.setdefault(table, []).append((col, nullable == "YES"))
 
-    cur.execute(
-        """
-        SELECT tc.table_name, kcu.column_name, ccu.table_name, rc.delete_rule
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage ccu
-          ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-        JOIN information_schema.referential_constraints rc
-          ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s
-        """,
-        (schema,),
-    )
     fks_by_table: dict[str, list[tuple[str, str, str]]] = {}
-    for table, col, ref_table, delete_rule in cur.fetchall():
+    for table, col, ref_table, _ref_col, delete_rule in _fetch_fk_rows(
+        cur, schema, with_delete_rule=True
+    ):
         fks_by_table.setdefault(table, []).append((col, ref_table, delete_rule))
 
     result: set[str] = set()

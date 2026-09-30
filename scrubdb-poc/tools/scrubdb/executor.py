@@ -48,17 +48,83 @@ def _empty_literal(data_type):
     return None
 
 
-def _unique_suffix(old, ctx) -> str:
+# Hex characters of HMAC carried by a distinctness suffix. 8 (32 bits) was not
+# enough: website_visitor.access_token holds 45666 distinct values that
+# ``redact`` all masks to the same "***", so the suffix alone had to keep them
+# apart, and by the birthday bound a 32-bit one collided in ~22% of runs
+# (measured: 7 of 40 random run keys). 16 (64 bits) puts that near 1e-10.
+_UNIQUE_SUFFIX_HEX = 16
+_MAX_SUFFIX_ATTEMPTS = 100
+
+
+def _unique_suffix(old, ctx, attempt: int = 0, width: int = _UNIQUE_SUFFIX_HEX) -> str:
     """Short deterministic token, distinct per distinct original value.
 
     Appended to a masked value on UNIQUE/PK columns so masked values stay
-    distinct (no constraint violation on --apply). Stable across the run.
+    distinct (no constraint violation on --apply). Stable across the run: the
+    same original masks to the same output wherever it appears, which is what
+    keeps a value that is duplicated across columns consistent after scrubbing.
+
+    ``attempt`` re-derives a different suffix for the same original, used by
+    :func:`_distinct_suffixed` to resolve the rare residual collision.
     """
-    return "_" + ctx.digest("uniq", old).hex()[:8]
+    parts = ("uniq", old) if attempt == 0 else ("uniq", old, attempt)
+    return "_" + ctx.digest(*parts).hex()[:width]
 
 
-def _widen_unique_text_column(cur, src, col) -> None:
-    """Drop any length cap on a column about to get ``_unique_suffix`` appended.
+def _suffix_width(cap) -> int:
+    """Hex characters of suffix that fit a column capped at ``cap``.
+
+    Full width when the column is uncapped, which is the usual case — a cap
+    only survives this far when widening the column was refused because a view
+    depends on it (see :func:`_widen_unique_text_column`). Otherwise leave room
+    for the "_" and at least one character of masked body, and never drop below
+    the 8 hex characters scrubdb used everywhere before.
+    """
+    if cap is None:
+        return _UNIQUE_SUFFIX_HEX
+    return max(8, min(_UNIQUE_SUFFIX_HEX, cap - 2))
+
+
+def _distinct_suffixed(masked: str, old, ctx, cap, taken: set) -> str:
+    """Suffix ``masked`` so the result is distinct from everything in ``taken``.
+
+    Because the suffix is derived from the original value, distinctness is
+    probabilistic rather than guaranteed — widening the suffix makes a clash
+    unlikely, re-deriving on one makes it impossible. ``taken`` is seeded by
+    the caller with the column's *original* values as well, so a masked value
+    also cannot land on a row this statement has not rewritten yet: the
+    batched temp-table path applies its UPDATEs in sequence inside one
+    transaction, so a later batch sees what an earlier batch wrote.
+    """
+    width = _suffix_width(cap)
+    for attempt in range(_MAX_SUFFIX_ATTEMPTS):
+        candidate = _fit_within_cap(masked, _unique_suffix(old, ctx, attempt, width), cap)
+        if candidate not in taken:
+            taken.add(candidate)
+            return candidate
+    raise ValueError(
+        f"no distinct masked value found after {_MAX_SUFFIX_ATTEMPTS} attempts "
+        f"(suffix width {width}, column cap {cap})"
+    )
+
+
+def _text_length_cap(cur, schema: str, table: str, column: str):
+    """The column's ``varchar(n)``/``char(n)`` cap, or ``None`` if uncapped."""
+    cur.execute(
+        """
+        SELECT character_maximum_length
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s AND column_name = %s
+        """,
+        (schema, table, column),
+    )
+    rows = cur.fetchall()
+    return rows[0][0] if rows else None
+
+
+def _widen_unique_text_column(cur, src, col, cap) -> bool:
+    """Drop the length cap on a column about to get ``_unique_suffix`` appended.
 
     This only runs on a disposable, already-anonymized copy, so there's no
     reason to keep enforcing the original varchar(n)/char(n) cap once its
@@ -68,8 +134,61 @@ def _widen_unique_text_column(cur, src, col) -> None:
     the masked value plus its 9-character suffix no longer fits (seen live on
     Odoo's 21-char Mexican customs/pedimento number field, already at the
     limit before masking).
+
+    Returns whether the column is now uncapped. Two ways it can be False:
+
+    * ``cap`` is None — the column is plain ``character varying`` with no
+      length at all, so there is nothing to widen. Most Odoo text columns are
+      this shape (1109 of the 1131 tables here have no capped column at all),
+      and running the ALTER on them anyway is what broke the run: PostgreSQL
+      refuses to retype a column a view is built on, and ``utm_campaign.name``
+      feeds ``mailing_trace_report``. Skipping the no-op ALTER also keeps
+      scrubdb from touching the catalog for hundreds of columns it has no
+      reason to change.
+    * The ALTER is genuinely needed but refused, because the column is both
+      capped *and* used by a view or rule. Then the caller has to make the
+      suffix fit inside the cap instead; see ``_fit_within_cap``.
     """
-    cur.execute(f"ALTER TABLE {src} ALTER COLUMN {col} TYPE text")
+    if cap is None:
+        return False
+    cur.execute("SAVEPOINT scrubdb_widen")
+    try:
+        cur.execute(f"ALTER TABLE {src} ALTER COLUMN {col} TYPE text")
+    except Exception as exc:
+        # Matched on SQLSTATE rather than psycopg2's exception class: the
+        # driver is an optional import here (see ``connect``), and naming
+        # psycopg2.errors in an except clause would make the engine and its
+        # tests need it installed. 0A000 is feature_not_supported, which is
+        # what "cannot alter type of a column used by a view or rule" raises.
+        if getattr(exc, "pgcode", None) != "0A000":
+            raise
+        # Recoverable, but the failed statement has aborted the transaction —
+        # rewind to the savepoint before anything else runs on this connection.
+        cur.execute("ROLLBACK TO SAVEPOINT scrubdb_widen")
+        cur.execute("RELEASE SAVEPOINT scrubdb_widen")
+        _logger.info("%s.%s: keeping varchar(%s), a view or rule depends on it; "
+                     "masked values will be trimmed to fit", src, col, cap)
+        return False
+    cur.execute("RELEASE SAVEPOINT scrubdb_widen")
+    return True
+
+
+def _fit_within_cap(masked: str, suffix: str, cap) -> str:
+    """``masked + suffix``, trimmed so it still fits a column capped at ``cap``.
+
+    The suffix carries the distinctness guarantee (it is derived from the
+    original value), so it is the part that must survive intact — the masked
+    body is trimmed from the right to make room. With no cap, or room to
+    spare, nothing is trimmed.
+    """
+    if cap is None or len(masked) + len(suffix) <= cap:
+        return masked + suffix
+    if len(suffix) > cap:
+        raise ValueError(
+            f"cannot keep masked values distinct within varchar({cap}): "
+            f"the {len(suffix)}-character distinctness suffix does not fit"
+        )
+    return masked[:cap - len(suffix)] + suffix
 
 
 def _map_json_strings(obj, fn, ctx):
@@ -213,10 +332,18 @@ def _apply_column(cur, action: Action, ctx: Context, schema: str, batch_size: in
     cast = f"::{action.data_type}" if needs_cast else ""
     match_expr = f"t.{col}::text" if needs_cast else f"t.{col}"
 
+    cap = None
+    taken: set = set()
     if action.unique and is_text:
         # A distinctness suffix (`_unique_suffix`, below) is about to be
-        # appended to every masked value in this column — drop first.
-        _widen_unique_text_column(cur, src, col)
+        # appended to every masked value in this column — drop the length cap
+        # first, and if the cap has to stay, trim the masked body to fit it.
+        cap = _text_length_cap(cur, schema, action.table, action.column)
+        if _widen_unique_text_column(cur, src, col, cap):
+            cap = None
+        # Masked values must be distinct from each other and from any original
+        # still in the column — see _distinct_suffixed.
+        taken = set(originals)
 
     mapping = []
     for old in originals:
@@ -226,7 +353,7 @@ def _apply_column(cur, action: Action, ctx: Context, schema: str, batch_size: in
             new = action.fn(old, ctx)
             # Keep UNIQUE/PK text columns distinct after masking.
             if action.unique and is_text and isinstance(new, str):
-                new = new + _unique_suffix(old, ctx)
+                new = _distinct_suffixed(new, old, ctx, cap, taken)
         mapping.append((old, new))
     # Skip pairs where the value is unchanged (e.g. keep).
     mapping = [(o, n) for (o, n) in mapping if n != o]
@@ -234,7 +361,8 @@ def _apply_column(cur, action: Action, ctx: Context, schema: str, batch_size: in
         return (0, len(originals))
 
     rows_updated = _run_update_with_retry(
-        cur, src, col, cast, match_expr, t_guard, mapping, batch_size, action, ctx, is_text
+        cur, src, col, cast, match_expr, t_guard, mapping, batch_size,
+        action, ctx, is_text, schema,
     )
     return (rows_updated, len(originals))
 
@@ -250,7 +378,7 @@ def _run_update(cur, src, col, cast, match_expr, t_guard, mapping, batch_size) -
 
 
 def _run_update_with_retry(cur, src, col, cast, match_expr, t_guard, mapping, batch_size,
-                            action: Action, ctx, is_text: bool) -> int:
+                            action: Action, ctx, is_text: bool, schema: str) -> int:
     """Run the UPDATE; on a UniqueViolation, retry once with a forced suffix.
 
     Introspection (``introspect.fetch_unique_columns``) only sees real
@@ -267,12 +395,15 @@ def _run_update_with_retry(cur, src, col, cast, match_expr, t_guard, mapping, ba
     ``_unique_suffix``). If the column was already suffixed (or isn't text)
     the violation is a genuine bug elsewhere, so it's re-raised immediately.
     """
-    import psycopg2  # lazy: mirrors connect()'s own lazy import
-
     cur.execute("SAVEPOINT scrubdb_col")
     try:
         rows = _run_update(cur, src, col, cast, match_expr, t_guard, mapping, batch_size)
-    except psycopg2.errors.UniqueViolation:
+    except Exception as exc:
+        # SQLSTATE 23505 is unique_violation. Matched on the code rather than
+        # psycopg2.errors.UniqueViolation so the executor needs no driver
+        # import at all (see ``connect`` and _widen_unique_text_column).
+        if getattr(exc, "pgcode", None) != "23505":
+            raise
         cur.execute("ROLLBACK TO SAVEPOINT scrubdb_col")
         if action.unique or not is_text:
             raise
@@ -282,8 +413,14 @@ def _run_update_with_retry(cur, src, col, cast, match_expr, t_guard, mapping, ba
             "retrying with a forced distinctness suffix",
             action.table, action.column,
         )
-        _widen_unique_text_column(cur, src, col)
-        suffixed = [(old, new if new is None else str(new) + _unique_suffix(old, ctx))
+        # Same cap handling as the known-unique path in _apply_column: this
+        # column wasn't known to be unique, so its cap hasn't been looked at yet.
+        cap = _text_length_cap(cur, schema, action.table, action.column)
+        if _widen_unique_text_column(cur, src, col, cap):
+            cap = None
+        taken = {old for old, _ in mapping}
+        suffixed = [(old, new if new is None else
+                     _distinct_suffixed(str(new), old, ctx, cap, taken))
                     for old, new in mapping]
         rows = _run_update(cur, src, col, cast, match_expr, t_guard, suffixed, batch_size)
     cur.execute("RELEASE SAVEPOINT scrubdb_col")

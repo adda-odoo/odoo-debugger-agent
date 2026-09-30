@@ -8,3 +8,10 @@
 **/*.egg-info/
 **/.mypy_cache/
 **/.ruff_cache/
+
+# Host-side only: copy_and_scrub_db.sh reads this straight off the host, so it
+# has no business in the image. It sits next to odoo_common.yml (both drive
+# scrubdb), which puts it under the `COPY scrubdb-poc/tools/scrubdb` layer —
+# excluding it here keeps an allowlist edit from invalidating that COPY and the
+# pip install of scrubdb right after it on the next start.sh.
+scrubdb-poc/tools/scrubdb/rules/scrub_allowlist.txt
