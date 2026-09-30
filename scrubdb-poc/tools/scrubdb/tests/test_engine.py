@@ -15,6 +15,7 @@ import sys
 # Put the directory that *contains* the scrubdb package (tools/) on the path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import datetime as _dt  # noqa: E402
 from scrubdb import classify, cli, introspect, policy, transforms  # noqa: E402
 from scrubdb.executor import apply_plan  # noqa: E402
 from scrubdb.transforms import Context  # noqa: E402
@@ -493,6 +494,53 @@ def test_date_shift_unparseable_left_unchanged():
 
 class _RowCursor:
     def __init__(self, rows):
+def test_date_shift_survives_dates_pinned_to_the_domain_edge():
+    # Odoo parks sentinel dates on the edges of the range Python and
+    # PostgreSQL share (oes_humeau has 60352 product_value.date rows on
+    # 0001-01-01 00:00:00). Roughly half of all run keys draw a negative
+    # offset, which on an edge-pinned date would overflow and abort the whole
+    # run without the turnaround in transforms._shift.
+    edges = ("0001-01-01", "9999-12-31",
+             "0001-01-01 00:00:00", "9999-12-31 23:59:59")
+    for seed in range(200):                 # ~100 of these pick each direction
+        ctx = Context(b"key-%d" % seed)
+        for value in edges:
+            shifted = transforms.date_shift(value, ctx)
+            assert shifted != value, f"{value} unchanged with key {seed}"
+            if len(value) == 10:
+                _dt.date.fromisoformat(shifted)          # still a valid date
+            else:
+                _dt.datetime.strptime(shifted, "%Y-%m-%d %H:%M:%S")
+
+
+def test_date_shift_pads_years_below_1000():
+    # strftime("%Y") does not zero-pad on glibc, so a timestamp shifted into
+    # year 1-999 would render as "1-05-19 00:00:00" — text PostgreSQL rejects
+    # when the masked value is cast back into the column.
+    ctx = Context(b"k")
+    shifted = transforms.date_shift("0001-06-15 12:00:00", ctx)
+    assert shifted[:4].isdigit() and len(shifted) == 19, shifted
+    _dt.datetime.strptime(shifted, "%Y-%m-%d %H:%M:%S")
+
+
+def test_date_offset_is_never_zero():
+    # A zero offset makes date_shift a no-op on every date in the database,
+    # which surfaces as corruption rather than as "nothing masked":
+    # _ensure_changed hands each unchanged value to _nudge, and nudging a
+    # date's text mutates a character in place ("9999-12-31" -> "9999-12-32").
+    for seed in range(5000):
+        assert transforms._date_offset(Context(b"key-%d" % seed)).days != 0
+    # and it must still be a single run-global value, not per-value
+    ctx = Context(b"k")
+    assert transforms._date_offset(ctx) == transforms._date_offset(ctx)
+
+
+def test_nudge_would_corrupt_a_date_which_is_why_date_shift_must_not_no_op():
+    # Documents the hazard the two tests above exist to keep out of reach:
+    # _nudge is shape-preserving, not domain-aware.
+    assert transforms._nudge("9999-12-31", Context(b"k")) == "9999-12-32"
+
+
         self._rows = rows
 
     def execute(self, sql, params=None):

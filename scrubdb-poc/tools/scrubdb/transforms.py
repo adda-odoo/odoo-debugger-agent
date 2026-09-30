@@ -266,6 +266,42 @@ def mask_name(value, ctx):
     return "".join(parts)
 
 
+def _date_offset(ctx) -> "_datetime.timedelta":
+    """The run-global shift: 1 to 365 days, in either direction, never zero.
+
+    Magnitude and sign are drawn separately so that zero is not in the range.
+    Drawing it as ``% 731 - 365`` put zero in the range once every ~731 runs
+    (the run key is fresh ``os.urandom`` per run), and a zero shift makes
+    ``date_shift`` a no-op on every date in the database — which does not show
+    up as "nothing was masked" but as corruption, because ``_ensure_changed``
+    then hands each unchanged value to :func:`_nudge`, and nudging a date's
+    text mutates one character in place ("9999-12-31" -> "9999-12-32").
+    """
+    magnitude = ctx.int_for("date_shift", "global") % 365 + 1
+    sign = -1 if ctx.int_for("date_shift", "global", "sign") % 2 else 1
+    return _datetime.timedelta(days=sign * magnitude)
+
+
+def _shift(point, offset):
+    """Apply ``offset`` to a date/datetime, turning it around at the domain edge.
+
+    Odoo pins sentinel dates to the edges of the range Python and PostgreSQL
+    share — this database holds 60352 ``product_value.date`` rows sitting on
+    ``0001-01-01 00:00:00`` — and about half of all runs draw a negative
+    offset, so every one of those rows raised ``OverflowError: date value out
+    of range`` and aborted the run. Shifting by the same magnitude in the
+    opposite direction keeps the value inside the domain and still genuinely
+    changed. Edge-pinned values all turn around together, so they stay
+    correctly ordered among themselves; the alternative (clamping, i.e.
+    leaving the value where it is) loses that and feeds :func:`_nudge` a date
+    it can corrupt.
+    """
+    try:
+        return point + offset
+    except OverflowError:
+        return point - offset
+
+
 def date_shift(value, ctx):
     """Shift a date/timestamp by a single run-global offset (+/- 365 days).
 
@@ -273,17 +309,19 @@ def date_shift(value, ctx):
     anonymised while ordering and the gaps between related timestamps are
     preserved (before/after and duration logic still holds). Operates on the
     ISO text form; unparseable values are left unchanged rather than corrupted.
+    Dates already at the edge of the representable range are shifted the other
+    way instead of overflowing — see :func:`_shift`.
     """
     if value is None:
         return None
     s = str(value).strip()
     if not s:
         return value
-    offset = _datetime.timedelta(days=(ctx.int_for("date_shift", "global") % 731) - 365)
+    offset = _date_offset(ctx)
     # Pure date (YYYY-MM-DD).
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         try:
-            return (_datetime.date.fromisoformat(s) + offset).isoformat()
+            return _shift(_datetime.date.fromisoformat(s), offset).isoformat()
         except ValueError:
             return value
     # Timestamp: tolerate a space or 'T' separator, drop any tz/fractional tail.
@@ -294,7 +332,11 @@ def date_shift(value, ctx):
             dt = _datetime.datetime.strptime(core, fmt)
         except ValueError:
             continue
-        return (dt + offset).strftime("%Y-%m-%d %H:%M:%S")
+        # isoformat, not strftime: glibc's %Y does not zero-pad years below
+        # 1000, so a value shifted into year 1-999 came back as "1-05-19
+        # 00:00:00" — text PostgreSQL rejects on the cast back. isoformat
+        # always pads the year to four digits.
+        return _shift(dt, offset).isoformat(sep=" ", timespec="seconds")
     return value
 
 
