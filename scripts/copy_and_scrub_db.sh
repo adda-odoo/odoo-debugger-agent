@@ -39,6 +39,19 @@ psql -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_USER" -d postgres -tAc \
     "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 \
     || { echo "Source database '$DB_NAME' not found on main (port $SRC_PORT)" >&2; exit 1; }
 
+# Determine the source's Odoo major version from the base module. Odoo 19+
+# uses the pgvector extension; earlier versions (18 and below) do not need it.
+# The aidev role isn't a superuser, so `CREATE EXTENSION vector` — which a dump
+# of any database that happens to have vector installed will carry — fails with
+# "permission denied to create extension". For pre-19 databases that extension
+# is dead weight (no vector-typed columns depend on it), so we strip it from
+# the restore rather than try (and fail) to create it.
+BASE_VERSION=$(psql -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_USER" -d "$DB_NAME" -tAc \
+    "SELECT latest_version FROM ir_module_module WHERE name = 'base'" 2>/dev/null || true)
+ODOO_MAJOR="${BASE_VERSION%%.*}"
+[ -n "$ODOO_MAJOR" ] || ODOO_MAJOR=0
+log "Source '$DB_NAME' reports Odoo major version ${ODOO_MAJOR} (base=${BASE_VERSION:-unknown})."
+
 log "Creating '$DB_NAME' on aidev..."
 createdb -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" "$DB_NAME" \
     --encoding unicode --template template0 --lc-collate C --lc-ctype C
@@ -46,9 +59,23 @@ createdb -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" "$DB_NAME" \
 log "Dumping '$DB_NAME' from main..."
 pg_dump -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_USER" -Fc -f "$DUMP_FILE" "$DB_NAME"
 
-log "Restoring into aidev..."
-pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" \
-    --no-owner --no-privileges -j 4 "$DUMP_FILE"
+if [ "$ODOO_MAJOR" -ge 19 ]; then
+    log "Restoring into aidev (Odoo ${ODOO_MAJOR}: keeping pgvector extension)..."
+    pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" \
+        --no-owner --no-privileges -j 4 "$DUMP_FILE"
+else
+    # Pre-19: filter the vector extension (and its comment) out of the archive's
+    # table of contents so pg_restore never issues CREATE EXTENSION vector, which
+    # the non-superuser aidev role can't run. Match the extension entries
+    # precisely to avoid dropping anything else.
+    log "Restoring into aidev (Odoo ${ODOO_MAJOR}: stripping unused pgvector extension)..."
+    RESTORE_LIST="$(mktemp --suffix=.list)"
+    trap 'rm -f "$DUMP_FILE" "$MERGED_RULES_FILE" "$RESTORE_LIST"' EXIT
+    pg_restore -l "$DUMP_FILE" \
+        | grep -vE 'EXTENSION - vector( |$)|EXTENSION vector( |$)' > "$RESTORE_LIST"
+    pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" \
+        --no-owner --no-privileges -j 4 -L "$RESTORE_LIST" "$DUMP_FILE"
+fi
 
 COMMON_RULES_FILE="$RULES_DIR/odoo_common.yml"
 DB_RULES_FILE="$SCRIPT_DIR/scrub_rules/${DB_NAME}.yml"
