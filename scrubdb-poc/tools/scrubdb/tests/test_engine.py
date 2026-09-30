@@ -34,8 +34,9 @@ class _Args:
 # --- mocks -----------------------------------------------------------------
 
 class MockCursor:
-    def __init__(self, columns=None, distinct=None, sample=None):
+    def __init__(self, columns=None, distinct=None, sample=None, length_cap=None):
         self._columns = columns or []
+        self._length_cap = length_cap      # varchar(n) cap for _text_length_cap
         self._distinct = distinct or []
         self._sample = [] if sample is None else sample
         self._result = []
@@ -53,19 +54,22 @@ class MockCursor:
         if s.startswith("ALTER"):
             self.alters.append(s)
             self._result = []
+        elif "character_maximum_length" in s:
+            # _text_length_cap: the column's varchar(n) cap, None when uncapped
+            self._result = [(self._length_cap,)]
         elif "information_schema.columns" in s:
             self._result = list(self._columns)
-        elif s.startswith("SELECT DISTINCT"):
-            self.selects.append(s)
-            self._result = [(v,) for v in self._distinct]
-        elif s.startswith("INSERT"):
-            self.inserts.append((s, params))
         elif "information_schema.tables" in s:
             # fetch_columns reads tables and columns as two single-view queries
             # and intersects them in Python, so the mock has to answer both.
             # Every table named in `columns` is a BASE TABLE here; view
             # filtering is covered by test_fetch_columns_restricts_to_base_tables.
             self._result = [(t,) for t in dict.fromkeys(t for t, *_ in self._columns)]
+        elif s.startswith("SELECT DISTINCT"):
+            self.selects.append(s)
+            self._result = [(v,) for v in self._distinct]
+        elif s.startswith("INSERT"):
+            self.inserts.append((s, params))
             self._result = []
         elif s.startswith("UPDATE"):
             self.updates.append((s, params))
@@ -490,10 +494,6 @@ def test_date_shift_unparseable_left_unchanged():
     assert transforms.date_shift("not a date", Context(b"k")) == "not a date"
 
 
-# --- blanket mode: introspection -------------------------------------------
-
-class _RowCursor:
-    def __init__(self, rows):
 def test_date_shift_survives_dates_pinned_to_the_domain_edge():
     # Odoo parks sentinel dates on the edges of the range Python and
     # PostgreSQL share (oes_humeau has 60352 product_value.date rows on
@@ -541,6 +541,10 @@ def test_nudge_would_corrupt_a_date_which_is_why_date_shift_must_not_no_op():
     assert transforms._nudge("9999-12-31", Context(b"k")) == "9999-12-32"
 
 
+# --- blanket mode: introspection -------------------------------------------
+
+class _RowCursor:
+    def __init__(self, rows):
         self._rows = rows
 
     def execute(self, sql, params=None):
@@ -548,6 +552,58 @@ def test_nudge_would_corrupt_a_date_which_is_why_date_shift_must_not_no_op():
 
     def fetchall(self):
         return self._rows
+
+
+class _FkCursor:
+    """Answers the four single-view reads ``_fetch_fk_rows`` now issues.
+
+    Takes the FK rows in the shape the old single joined query returned —
+    ``(table, column, ref_table, ref_column, delete_rule)`` — and splits them
+    back out per view, so the tests keep describing foreign keys rather than
+    information_schema's internals.
+    """
+
+    def __init__(self, fks):
+        self._fks = [(f"{t}_{c}_fkey", t, c, rt, rc, rule) for t, c, rt, rc, rule in fks]
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "table_constraints" in s:
+            self._rows = [(n, t) for n, t, _, _, _, _ in self._fks]
+        elif "key_column_usage" in s:
+            self._rows = [(n, c) for n, _, c, _, _, _ in self._fks]
+        elif "constraint_column_usage" in s:
+            self._rows = [(n, rt, rc) for n, _, _, rt, rc, _ in self._fks]
+        elif "referential_constraints" in s:
+            self._rows = [(n, rule) for n, _, _, _, _, rule in self._fks]
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+
+class _SchemaCursor(_FkCursor):
+    """``_FkCursor`` plus the tables/columns reads, for introspection that needs both.
+
+    ``columns`` rows come in as ``(table, column, is_nullable)``; the data_type
+    ``_fetch_base_table_columns`` also selects is irrelevant to these tests, so
+    it is filled in as text.
+    """
+
+    def __init__(self, columns, fks):
+        super().__init__(fks)
+        self._columns = [(t, c, "text", n) for t, c, n in columns]
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "information_schema.tables" in s:
+            self._rows = [(t,) for t in dict.fromkeys(t for t, *_ in self._columns)]
+        elif "information_schema.columns" in s:
+            self._rows = list(self._columns)
+        else:
+            super().execute(sql, params)
 
 
 def test_fetch_foreign_key_columns_both_sides():
@@ -602,58 +658,6 @@ def test_blanket_type_routing():
         ("t", "amount", "numeric"),
         ("t", "flag", "boolean"),
         ("t", "uid", "uuid"),
-class _FkCursor:
-    """Answers the four single-view reads ``_fetch_fk_rows`` now issues.
-
-    Takes the FK rows in the shape the old single joined query returned —
-    ``(table, column, ref_table, ref_column, delete_rule)`` — and splits them
-    back out per view, so the tests keep describing foreign keys rather than
-    information_schema's internals.
-    """
-
-    def __init__(self, fks):
-        self._fks = [(f"{t}_{c}_fkey", t, c, rt, rc, rule) for t, c, rt, rc, rule in fks]
-        self._rows = []
-
-    def execute(self, sql, params=None):
-        s = " ".join(sql.split())
-        if "table_constraints" in s:
-            self._rows = [(n, t) for n, t, _, _, _, _ in self._fks]
-        elif "key_column_usage" in s:
-            self._rows = [(n, c) for n, _, c, _, _, _ in self._fks]
-        elif "constraint_column_usage" in s:
-            self._rows = [(n, rt, rc) for n, _, _, rt, rc, _ in self._fks]
-        elif "referential_constraints" in s:
-            self._rows = [(n, rule) for n, _, _, _, _, rule in self._fks]
-        else:
-            self._rows = []
-
-    def fetchall(self):
-        return self._rows
-
-
-class _SchemaCursor(_FkCursor):
-    """``_FkCursor`` plus the tables/columns reads, for introspection that needs both.
-
-    ``columns`` rows come in as ``(table, column, is_nullable)``; the data_type
-    ``_fetch_base_table_columns`` also selects is irrelevant to these tests, so
-    it is filled in as text.
-    """
-
-    def __init__(self, columns, fks):
-        super().__init__(fks)
-        self._columns = [(t, c, "text", n) for t, c, n in columns]
-
-    def execute(self, sql, params=None):
-        s = " ".join(sql.split())
-        if "information_schema.tables" in s:
-            self._rows = [(t,) for t in dict.fromkeys(t for t, *_ in self._columns)]
-        elif "information_schema.columns" in s:
-            self._rows = list(self._columns)
-        else:
-            super().execute(sql, params)
-
-
         ("t", "payload", "jsonb"),
     )
     plan = policy.build_blanket_plan(cols)
@@ -704,23 +708,221 @@ def test_apply_plan_unique_appends_distinct_suffix():
     apply_plan(MockConn(cur), plan, dry_run=False)
     _, params = cur.updates[0]
     news = params[1::2]
-    assert all(re.search(r"_[0-9a-f]{8}$", n) for n in news)  # deterministic suffix
+    assert all(re.search(_suffix_re(), n) for n in news)  # deterministic suffix
     assert len(set(news)) == len(news)                        # stays distinct
+
+
+def _customs_number_plan():
+    """Odoo's 21-char Mexican customs/pedimento number: unique and capped."""
+    cols = [introspect.Column("stock_landed_cost", "l10n_mx_edi_customs_number",
+                              "character varying", True)]
+    return policy.build_blanket_plan(cols, unique_columns={
+        ("stock_landed_cost", "l10n_mx_edi_customs_number")})
+
+
+def test_apply_plan_constant_mask_on_a_unique_column_stays_distinct():
+    # Wiring check for the website_visitor.access_token shape: a unique column
+    # whose transform (`redact`) maps every input to the same "***", so the
+    # distinctness suffix carries the entire uniqueness burden. The collision
+    # this guards against is probabilistic, so the deterministic proof is
+    # test_distinct_suffixed_under_heavy_collision_pressure below; this one
+    # checks redact + unique actually reaches _distinct_suffixed at all.
+    cols = [introspect.Column("website_visitor", "access_token",
+                              "character varying", False)]
+    plan = policy.build_blanket_plan(
+        cols, overrides={"website_visitor": {"access_token": "redact"}},
+        unique_columns={("website_visitor", "access_token")})
+    assert plan.actions[0].unique is True
+    originals = ["tok-%d" % i for i in range(5000)]
+    cur = MockCursor(distinct=originals)
+    apply_plan(MockConn(cur), plan, dry_run=False)
+    news = [n for _, params in cur.updates for n in params[1::2]]
+    assert len(news) == len(originals)
+    assert len(set(news)) == len(news)          # the constraint that was violated
+    assert all(n.startswith("***_") for n in news)
+
+
+def test_distinct_suffixed_under_heavy_collision_pressure():
+    # The deterministic version of the bug: a digest space small enough that
+    # collisions are certain, not merely likely. website_visitor.access_token
+    # hit this for real — 45666 values redacted to a constant "***" with a
+    # 32-bit suffix collide by the birthday bound in ~22% of runs (measured 7
+    # of 40). Every masked value must still come out distinct.
+    from scrubdb import executor
+
+    import hashlib
+
+    class _Narrow:
+        """A real hash, but with only 16 bits of entropy.
+
+        Large enough that 1000 values fit, small enough that collisions are a
+        certainty rather than a 22% chance — the same failure, made reliable.
+        """
+        def digest(self, *parts):
+            msg = "\x1f".join(str(p) for p in parts).encode()
+            return hashlib.sha256(msg).digest()[:2] + b"\x00" * 30
+
+    ctx = _Narrow()
+    originals = ["tok-%d" % i for i in range(1000)]
+
+    # the collisions are real: attempt 0 alone cannot keep these apart
+    first_pass = {executor._unique_suffix(o, ctx) for o in originals}
+    assert len(first_pass) < len(originals), "test no longer exercises a collision"
+
+    taken = set()
+    out = [executor._distinct_suffixed("***", o, ctx, None, taken) for o in originals]
+    assert len(set(out)) == len(out) == 1000      # the constraint that was violated
+    assert all(o.startswith("***_") for o in out)
+
+
+def test_distinct_suffixed_resolves_a_forced_collision():
+    # Two different originals whose suffixes collide must not produce the same
+    # masked value: the second re-derives instead of duplicating.
+    from scrubdb import executor
+
+    class _Collide:
+        """Context whose digest ignores the value, forcing attempt 0 to clash."""
+        def __init__(self): self.calls = 0
+        def digest(self, *parts):
+            # same digest for every original at attempt 0, distinct after
+            return bytes([len(parts)]) * 32
+
+    ctx, taken = _Collide(), set()
+    a = executor._distinct_suffixed("***", "first", ctx, None, taken)
+    b = executor._distinct_suffixed("***", "second", ctx, None, taken)
+    assert a != b, (a, b)
+
+
+def test_distinct_suffixed_avoids_values_still_present_in_the_column():
+    # `taken` is seeded with the originals, so a masked value can't land on a
+    # row a later batch has yet to rewrite (the batched temp-table path applies
+    # its UPDATEs in sequence inside one transaction).
+    from scrubdb import executor
+    ctx = Context(b"k")
+    collided = executor._distinct_suffixed("x", "a", ctx, None, set())
+    taken = {collided}                       # pretend that value is still in the column
+    again = executor._distinct_suffixed("x", "a", ctx, None, taken)
+    assert again != collided
+
+
+def test_suffix_width_adapts_to_a_cap_without_going_below_the_old_width():
+    from scrubdb import executor
+    full = executor._UNIQUE_SUFFIX_HEX
+    assert executor._suffix_width(None) == full       # uncapped: the usual case
+    assert executor._suffix_width(1024) == full       # roomy cap: still full width
+    assert executor._suffix_width(12) == 10           # "_" + 10 hex + 1 body char
+    assert executor._suffix_width(2) == 8             # never narrower than the old 8
+    # and a cap too small for even that is refused rather than silently
+    # dropping the distinctness guarantee
+    try:
+        executor._fit_within_cap("x", "_" + "0" * 8, 2)
+    except ValueError as exc:
+        assert "does not fit" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError")
 
 
 def test_apply_plan_unique_text_column_widened_before_suffixing():
     # _unique_suffix appends 9 characters; a fixed-width varchar(n) column
     # already at its max length (e.g. Odoo's 21-char customs/pedimento
     # number) would overflow unless the cap is dropped first.
-    cols = [introspect.Column("stock_landed_cost", "l10n_mx_edi_customs_number",
-                              "character varying", True)]
-    plan = policy.build_blanket_plan(cols, unique_columns={
-        ("stock_landed_cost", "l10n_mx_edi_customs_number")})
-    cur = MockCursor(distinct=["26  07  3435  6010065", "26  07  3435  6010178"])
-    apply_plan(MockConn(cur), plan, dry_run=False)
+    cur = MockCursor(distinct=["26  07  3435  6010065", "26  07  3435  6010178"],
+                     length_cap=21)
+    apply_plan(MockConn(cur), _customs_number_plan(), dry_run=False)
     assert any("l10n_mx_edi_customs_number" in a and "TYPE text" in a for a in cur.alters)
     kinds = [kind for kind, _ in cur.ordered_calls]
     assert kinds.index("ALTER") < kinds.index("UPDATE")   # widened before the write that needs it
+
+
+def test_apply_plan_does_not_alter_an_uncapped_column():
+    # Most Odoo text columns are plain `character varying` with no length at
+    # all, so there is nothing to widen. Running the ALTER anyway is what
+    # aborted the run: PostgreSQL refuses to retype a column a view is built
+    # on, and utm_campaign.name feeds the mailing_trace_report view.
+    import re
+    cols = [introspect.Column("utm_campaign", "name", "character varying", False)]
+    plan = policy.build_blanket_plan(cols, unique_columns={("utm_campaign", "name")})
+    cur = MockCursor(distinct=["Summer sale", "Black friday"], length_cap=None)
+    apply_plan(MockConn(cur), plan, dry_run=False)
+    assert cur.alters == []
+    _, params = cur.updates[0]
+    assert all(re.search(_suffix_re(), n) for n in params[1::2])   # still suffixed
+
+
+def _suffix_re(width=None):
+    """Regex for a distinctness suffix, sized from the executor's own constant."""
+    from scrubdb import executor
+    return r"_[0-9a-f]{%d}$" % (width or executor._UNIQUE_SUFFIX_HEX)
+
+
+class _RefusedAlter(Exception):
+    """Stands in for psycopg2's FeatureNotSupported without importing it.
+
+    The executor matches on SQLSTATE, not on the driver's exception class,
+    precisely so these tests keep running with no psycopg2 installed.
+    """
+    pgcode = "0A000"
+
+
+class _DuplicateKey(Exception):
+    """Stands in for psycopg2's UniqueViolation. See :class:`_RefusedAlter`."""
+    pgcode = "23505"
+
+
+def test_apply_plan_fits_suffix_within_cap_when_widening_is_refused():
+    # Capped *and* used by a view: the ALTER can't succeed, so the masked body
+    # is trimmed to make room for the suffix rather than overflowing the column.
+    import re
+
+    class RefusingCursor(MockCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)          # still recorded in .alters
+            if sql.strip().startswith("ALTER"):
+                raise _RefusedAlter("cannot alter type of a column used by a view")
+
+    cur = RefusingCursor(distinct=["26  07  3435  6010065", "26  07  3435  6010178"],
+                         length_cap=21)
+    apply_plan(MockConn(cur), _customs_number_plan(), dry_run=False)
+    _, params = cur.updates[0]
+    news = params[1::2]
+    assert all(len(n) <= 21 for n in news), news        # fits the untouched cap
+    assert all(re.search(_suffix_re(), n) for n in news)
+    assert len(set(news)) == len(news)                  # still distinct
+    assert any("ROLLBACK TO SAVEPOINT scrubdb_widen" in s for _, s in cur.ordered_calls)
+
+
+def test_apply_plan_reraises_an_alter_failure_that_is_not_a_view_dependency():
+    # Only SQLSTATE 0A000 is recoverable; anything else is a real problem and
+    # must not be swallowed into a silent "keep the cap" fallback.
+    class _Disk(Exception):
+        pgcode = "53100"
+
+    class BrokenCursor(MockCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if sql.strip().startswith("ALTER"):
+                raise _Disk("no space left on device")
+
+    cur = BrokenCursor(distinct=["26  07  3435  6010065"], length_cap=21)
+    try:
+        apply_plan(MockConn(cur), _customs_number_plan(), dry_run=False)
+    except _Disk:
+        pass
+    else:
+        raise AssertionError("a non-0A000 ALTER failure was swallowed")
+
+
+def test_fit_within_cap_trims_the_body_not_the_suffix():
+    from scrubdb import executor
+    assert executor._fit_within_cap("abc", "_1234", None) == "abc_1234"
+    assert executor._fit_within_cap("abc", "_1234", 99) == "abc_1234"
+    assert executor._fit_within_cap("abcdefgh", "_1234", 8) == "abc_1234"
+    try:
+        executor._fit_within_cap("abc", "_1234", 3)   # suffix alone exceeds the cap
+    except ValueError as exc:
+        assert "does not fit" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError")
 
 
 def test_apply_plan_retries_once_on_unique_violation_then_succeeds():
@@ -730,8 +932,6 @@ def test_apply_plan_retries_once_on_unique_violation_then_succeeds():
     # in a dense sequence. The executor should retry once with the same
     # distinctness suffix used for known-unique columns instead of aborting
     # the whole run.
-    import psycopg2
-
     class _RaiseOnceCursor(MockCursor):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
@@ -742,7 +942,7 @@ def test_apply_plan_retries_once_on_unique_violation_then_succeeds():
             if s.startswith("UPDATE"):
                 self.update_attempts += 1
                 if self.update_attempts == 1:
-                    raise psycopg2.errors.UniqueViolation("duplicate key value")
+                    raise _DuplicateKey("duplicate key value")
             super().execute(sql, params)
 
     cols = [introspect.Column("account_move", "name", "character varying", False)]
@@ -760,13 +960,11 @@ def test_apply_plan_reraises_unique_violation_when_already_suffixed():
     # If the column was already known-unique (already suffixed) and still
     # collides, that's a genuine bug elsewhere — retrying blindly would just
     # loop, so the executor must re-raise instead.
-    import psycopg2
-
     class _AlwaysRaiseCursor(MockCursor):
         def execute(self, sql, params=None):
             s = " ".join(sql.split())
             if s.startswith("UPDATE"):
-                raise psycopg2.errors.UniqueViolation("duplicate key value")
+                raise _DuplicateKey("duplicate key value")
             super().execute(sql, params)
 
     cols = [introspect.Column("shop", "slug", "character varying", False)]
@@ -776,7 +974,7 @@ def test_apply_plan_reraises_unique_violation_when_already_suffixed():
     try:
         apply_plan(MockConn(cur), plan, dry_run=False)
         assert False, "expected UniqueViolation to propagate"
-    except psycopg2.errors.UniqueViolation:
+    except _DuplicateKey:
         pass
 
 
