@@ -59,6 +59,12 @@ class MockCursor:
             self._result = [(v,) for v in self._distinct]
         elif s.startswith("INSERT"):
             self.inserts.append((s, params))
+        elif "information_schema.tables" in s:
+            # fetch_columns reads tables and columns as two single-view queries
+            # and intersects them in Python, so the mock has to answer both.
+            # Every table named in `columns` is a BASE TABLE here; view
+            # filtering is covered by test_fetch_columns_restricts_to_base_tables.
+            self._result = [(t,) for t in dict.fromkeys(t for t, *_ in self._columns)]
             self._result = []
         elif s.startswith("UPDATE"):
             self.updates.append((s, params))
@@ -301,16 +307,22 @@ def test_introspect_fetch_columns():
 
 def test_fetch_columns_restricts_to_base_tables():
     # Must not return VIEW columns (e.g. hr_employee_public) — those aren't
-    # updatable and blanket masking would fail on them.
-    class Cap:
+    # updatable and blanket masking would fail on them. The restriction is a
+    # Python intersection, not SQL, so assert on the result, not the query text.
+    class Cur:
+        def __init__(self):
+            self.sql = []
         def execute(self, sql, params=None):
-            self.sql = " ".join(sql.split())
+            self.sql.append(" ".join(sql.split()))
         def fetchall(self):
-            return []
-    cap = Cap()
-    introspect.fetch_columns(cap)
-    assert "'BASE TABLE'" in cap.sql
-    assert "information_schema.tables" in cap.sql
+            if "information_schema.tables" in self.sql[-1]:
+                return [("res_partner",)]          # hr_employee_public is a VIEW
+            return [("res_partner", "email", "character varying", "YES"),
+                    ("hr_employee_public", "name", "character varying", "YES")]
+    cur = Cur()
+    cols = introspect.fetch_columns(cur)
+    assert [(c.table, c.name) for c in cols] == [("res_partner", "email")]
+    assert any("'BASE TABLE'" in s for s in cur.sql)
 
 
 # --- policy ----------------------------------------------------------------
@@ -492,7 +504,7 @@ class _RowCursor:
 
 def test_fetch_foreign_key_columns_both_sides():
     fk = introspect.fetch_foreign_key_columns(
-        _RowCursor([("sale_order", "partner_id", "res_partner", "id")]))
+        _FkCursor([("sale_order", "partner_id", "res_partner", "id", "SET NULL")]))
     assert ("sale_order", "partner_id") in fk   # referencing side
     assert ("res_partner", "id") in fk          # referenced side
 
@@ -542,6 +554,58 @@ def test_blanket_type_routing():
         ("t", "amount", "numeric"),
         ("t", "flag", "boolean"),
         ("t", "uid", "uuid"),
+class _FkCursor:
+    """Answers the four single-view reads ``_fetch_fk_rows`` now issues.
+
+    Takes the FK rows in the shape the old single joined query returned —
+    ``(table, column, ref_table, ref_column, delete_rule)`` — and splits them
+    back out per view, so the tests keep describing foreign keys rather than
+    information_schema's internals.
+    """
+
+    def __init__(self, fks):
+        self._fks = [(f"{t}_{c}_fkey", t, c, rt, rc, rule) for t, c, rt, rc, rule in fks]
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "table_constraints" in s:
+            self._rows = [(n, t) for n, t, _, _, _, _ in self._fks]
+        elif "key_column_usage" in s:
+            self._rows = [(n, c) for n, _, c, _, _, _ in self._fks]
+        elif "constraint_column_usage" in s:
+            self._rows = [(n, rt, rc) for n, _, _, rt, rc, _ in self._fks]
+        elif "referential_constraints" in s:
+            self._rows = [(n, rule) for n, _, _, _, _, rule in self._fks]
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+
+class _SchemaCursor(_FkCursor):
+    """``_FkCursor`` plus the tables/columns reads, for introspection that needs both.
+
+    ``columns`` rows come in as ``(table, column, is_nullable)``; the data_type
+    ``_fetch_base_table_columns`` also selects is irrelevant to these tests, so
+    it is filled in as text.
+    """
+
+    def __init__(self, columns, fks):
+        super().__init__(fks)
+        self._columns = [(t, c, "text", n) for t, c, n in columns]
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "information_schema.tables" in s:
+            self._rows = [(t,) for t in dict.fromkeys(t for t, *_ in self._columns)]
+        elif "information_schema.columns" in s:
+            self._rows = list(self._columns)
+        else:
+            super().execute(sql, params)
+
+
         ("t", "payload", "jsonb"),
     )
     plan = policy.build_blanket_plan(cols)
@@ -1157,17 +1221,14 @@ def test_fetch_transient_relation_tables_finds_pure_m2m_cascade():
         ("res_partner", "email", "YES"),
     ]
     fk_rows = [
-        ("account_move_validate_account_move_rel", "account_move_id", "account_move", "CASCADE"),
+        ("account_move_validate_account_move_rel", "account_move_id",
+         "account_move", "id", "CASCADE"),
         ("account_move_validate_account_move_rel", "validate_account_move_id",
-         "validate_account_move", "CASCADE"),
+         "validate_account_move", "id", "CASCADE"),
     ]
 
-    class Cur:
-        def execute(s, sql, params=None): s._sql = sql
-        def fetchall(s):
-            return columns_rows if "information_schema.columns" in s._sql else fk_rows
-
-    result = introspect.fetch_transient_relation_tables(Cur(), {"validate_account_move"})
+    result = introspect.fetch_transient_relation_tables(
+        _SchemaCursor(columns_rows, fk_rows), {"validate_account_move"})
     assert result == {"account_move_validate_account_move_rel"}
 
 
@@ -1177,21 +1238,18 @@ def test_fetch_transient_relation_tables_ignores_non_cascading_or_unrelated():
         ("some_rel_table", "b_id", "NO"),
     ]
 
-    class Cur:
-        def __init__(s, fk_rows): s._fk_rows = fk_rows
-        def execute(s, sql, params=None): s._sql = sql
-        def fetchall(s):
-            return columns_rows if "information_schema.columns" in s._sql else s._fk_rows
+    def Cur(fk_rows):
+        return _SchemaCursor(columns_rows, fk_rows)
 
     # NOT NULL + CASCADE but neither side is actually a transient table.
-    not_transient = Cur([("some_rel_table", "a_id", "table_a", "CASCADE"),
-                         ("some_rel_table", "b_id", "table_b", "CASCADE")])
+    not_transient = Cur([("some_rel_table", "a_id", "table_a", "id", "CASCADE"),
+                         ("some_rel_table", "b_id", "table_b", "id", "CASCADE")])
     assert introspect.fetch_transient_relation_tables(not_transient, {"some_wizard"}) == set()
 
     # Transient on one side, but RESTRICT instead of CASCADE — clearing the
     # wizard would fail outright, not silently cascade, so nothing to fold in.
-    not_cascade = Cur([("some_rel_table", "a_id", "some_wizard", "RESTRICT"),
-                       ("some_rel_table", "b_id", "table_b", "CASCADE")])
+    not_cascade = Cur([("some_rel_table", "a_id", "some_wizard", "id", "RESTRICT"),
+                       ("some_rel_table", "b_id", "table_b", "id", "CASCADE")])
     assert introspect.fetch_transient_relation_tables(not_cascade, {"some_wizard"}) == set()
 
 
