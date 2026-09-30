@@ -10,6 +10,7 @@ set -euo pipefail
 
 DB_NAME="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RULES_DIR="$SCRIPT_DIR/../scrubdb-poc/tools/scrubdb/rules"
 
 SRC_HOST=/var/run/postgresql
 SRC_PORT=5432
@@ -49,7 +50,7 @@ log "Restoring into aidev..."
 pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_USER" -d "$DB_NAME" \
     --no-owner --no-privileges -j 4 "$DUMP_FILE"
 
-COMMON_RULES_FILE="$SCRIPT_DIR/../scrubdb-poc/tools/scrubdb/rules/odoo_common.yml"
+COMMON_RULES_FILE="$RULES_DIR/odoo_common.yml"
 DB_RULES_FILE="$SCRIPT_DIR/scrub_rules/${DB_NAME}.yml"
 RULESET_FILE="$COMMON_RULES_FILE"
 if [ -f "$DB_RULES_FILE" ]; then
@@ -62,7 +63,7 @@ fi
 log "Running scrubdb (apply)..."
 PGHOST="$DST_HOST" PGPORT="$DST_PORT" PGUSER="$DST_USER" \
     scrubdb "$DB_NAME" --apply --i-confirm-this-is-a-copy --report "$REPORT_PATH" \
-    --exclude-file "$SCRIPT_DIR/scrub_allowlist.txt" \
+    --exclude-file "$RULES_DIR/scrub_allowlist.txt" \
     --ruleset "$RULESET_FILE"
 
 log "Running structural diff check (main vs aidev)..."
