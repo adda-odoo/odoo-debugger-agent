@@ -36,6 +36,14 @@ AI_DEV_HOST=/var/run/postgresql
 AI_DEV_PORT=5433
 AI_DEV_USER=odoo
 
+# Scrub-config registry, on the main cluster. Holds each database's allowlist +
+# scrub rules and an append-only snapshot of every run, so config survives
+# scrubbing other databases and a re-scrub can start from what was last applied.
+export REGISTRY_HOST=/var/run/postgresql
+export REGISTRY_PORT=5432
+export REGISTRY_USER=odoo
+export REGISTRY_DB=scrubdb_registry
+
 if [ -n "$DB_NAME" ]; then
     STATUS=$(psql -h "$AI_DEV_HOST" -p "$AI_DEV_PORT" -U "$AI_DEV_USER" -d "$DB_NAME" -tAc \
         "SELECT value FROM ir_config_parameter WHERE key = 'scrubdb.run_completed'" 2>/dev/null || true)
@@ -48,7 +56,17 @@ if [ -n "$DB_NAME" ]; then
         echo "Inspect/drop it manually before retrying (won't auto-overwrite)."
         exit 1
     else
-        echo "Database '$DB_NAME' not found on aidev — copying + scrubbing from main..."
+        echo "Database '$DB_NAME' not found on aidev — collecting scrub config + copying from main..."
+        REGISTRY_ARGS=(--host "$REGISTRY_HOST" --port "$REGISTRY_PORT" \
+            --user "$REGISTRY_USER" --dbname "$REGISTRY_DB")
+        python3 "$SCRIPT_DIR/scripts/scrub_registry.py" init "${REGISTRY_ARGS[@]}"
+        SCRUB_CFG_DIR="$(mktemp -d)"
+        # Opens $EDITOR prefilled with this database's last run, or the shared
+        # defaults on a first scrub. Writes allowlist.txt + ruleset.yml there.
+        python3 "$SCRIPT_DIR/scripts/scrub_registry.py" collect "$DB_NAME" \
+            "${REGISTRY_ARGS[@]}" --out-dir "$SCRUB_CFG_DIR"
+        export SCRUB_ALLOWLIST_FILE="$SCRUB_CFG_DIR/allowlist.txt"
+        export SCRUB_RULESET_FILE="$SCRUB_CFG_DIR/ruleset.yml"
         "$SCRIPT_DIR/scripts/copy_and_scrub_db.sh" "$DB_NAME"
     fi
     export DB_NAME

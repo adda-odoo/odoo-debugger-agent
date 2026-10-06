@@ -1,13 +1,19 @@
-# Per-database scrub rules
+# Per-database scrub rules (fallback)
 
-`copy_and_scrub_db.sh` always applies the shared ruleset
+**The normal way to set a database's scrub rules is interactively:** when
+`start.sh <db_name>` copies a database, it opens `$EDITOR` with that database's
+allowlist and rules (seeded from the shared defaults, or from the last run) and
+stores what you save in the `scrubdb_registry` database. See the main README's
+**Per-database scrub config** section. The files in this directory are the older
+mechanism, now a **fallback for when `start.sh` isn't driving the scrub** — e.g.
+calling `copy_and_scrub_db.sh` directly without the registry env vars set.
+
+In that fallback path, `copy_and_scrub_db.sh` applies the shared ruleset
 (`../../scrubdb-poc/tools/scrubdb/rules/odoo_common.yml`) via scrubdb's
 `--ruleset`. If a file named `<db_name>.yml` exists in this directory, it is
 merged on top of that shared ruleset (per table/column — a column listed here
 replaces the shared rule for that column; anything else in the table is kept)
-before scrubbing `<db_name>`, so a database with custom fields, modules, or
-unique constraints the shared ruleset doesn't anticipate can get its own
-targeted overrides without touching the shared file.
+before scrubbing `<db_name>`.
 
 Format matches `odoo_common.yml`:
 
