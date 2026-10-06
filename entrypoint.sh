@@ -42,7 +42,24 @@ if [ "$(id -u)" = "0" ]; then
         echo "  [WARN] /source/odoo/setup/debinstall.sh not found — skipping Odoo dependency install."
     fi
 
-    exec setpriv --reuid=debugger --regid=debugger --init-groups "$0" "$@"
+    # Carry CAP_SYS_PTRACE into the debugger user's ambient set so it survives
+    # the drop from root and is inherited by the MCP server and its profiling
+    # children (py-spy, gdb/memray). docker-compose's cap_add only puts the
+    # capability in the bounding set, which a non-root process can't use on its
+    # own — without this, py-spy/memray attach to the sibling odoo-bin fail with
+    # "Permission Denied" under the host's Yama ptrace_scope.
+    #
+    # Only when the capability is actually present (CapPrm bit 19 = 0x80000),
+    # so running the image without cap_add degrades to "profiling tools fail"
+    # rather than "setpriv errors and the container never starts".
+    PTRACE_CAPS=""
+    cap_prm="$(awk '/^CapPrm:/ {print $2}' /proc/self/status)"
+    if [ -n "$cap_prm" ] && [ "$(( 0x$cap_prm & 0x80000 ))" -ne 0 ]; then
+        PTRACE_CAPS="--inh-caps +sys_ptrace --ambient-caps +sys_ptrace"
+    else
+        echo "  [WARN] CAP_SYS_PTRACE not held — py-spy/memray profiling will be unavailable."
+    fi
+    exec setpriv --reuid=debugger --regid=debugger --init-groups $PTRACE_CAPS "$0" "$@"
 fi
 
 # The odoo/enterprise checkouts under /source are bind-mounted from the host

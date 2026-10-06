@@ -98,6 +98,13 @@ RUN python3 -m playwright install --with-deps chromium && \
     chromium --version && \
     rm -rf /var/lib/apt/lists/*
 
+# gdb is how `memray attach` (memray_attach tool) injects the tracker into the
+# running Odoo process; without it memray fails with "Cannot find a supported
+# lldb or gdb executable" (this image's Python 3.12 has no sys.remote_exec
+# fallback — that landed in 3.14). Its own late layer keeps the browser layer
+# above cached when this is added.
+RUN apt-get update && apt-get install -y gdb && rm -rf /var/lib/apt/lists/*
+
 # Create a non-root user for security.
 #
 # Its UID/GID must MATCH the host user who owns the bind-mounted repos, or the
