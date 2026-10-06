@@ -70,6 +70,12 @@ fi
 # under /source instead, since that's the whole point of this sandbox.
 git config --global --add safe.directory '*'
 
+# The handoff skill writes its documents here. /source is the bind-mounted
+# working directory, so these files land on the host and survive the --rm
+# container. Created as debugger (not in the root block above) so it stays
+# writable: root-owned paths on this bind mount lock the host user out.
+mkdir -p /source/handoff
+
 # PostgreSQL connection (standard libpq env vars). debug_server.py, the
 # oe-support restore pipeline (createdb/dropdb/pg_restore), and the scrubdb
 # CLI all resolve their Postgres target from these — set once, here, so
